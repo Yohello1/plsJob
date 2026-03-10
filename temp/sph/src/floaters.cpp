@@ -7,7 +7,22 @@
 namespace JD::floaters
 {
 
-    floater* floatersA = new floater[ FLOATER_AMT ];
+    floaters_soa floatersA = {
+        new float [ FLOATER_AMT ],
+        new float [ FLOATER_AMT ],
+        new float [ FLOATER_AMT ],
+        new float [ FLOATER_AMT ],
+        new float [ FLOATER_AMT ],
+        new float [ FLOATER_AMT ],
+        new float [ FLOATER_AMT ],
+        new float [ FLOATER_AMT ],
+        new float [ FLOATER_AMT ],
+        new float [ FLOATER_AMT ],
+        new float [ FLOATER_AMT ],
+        new float [ FLOATER_AMT ],
+        new float [ FLOATER_AMT ],
+        new bool  [ FLOATER_AMT ]
+    };
     block*   blocks    = new block  [ BLOCK_AMT   ];
 
 
@@ -22,25 +37,25 @@ namespace JD::floaters
         // initialize EVERYTHING to disabled out-of-bounds first
         for(size_t i = 0; i < FLOATER_AMT; i++)
         {
-            floatersA[i].x = -1000.0f;
-            floatersA[i].y = -1000.0f;
-            floatersA[i].v_x = 0;
-            floatersA[i].v_y = 0;
-            floatersA[i].mass = PARTICLE_MASS;
-            floatersA[i].density = PARTICLE_REFERENCE_DENSITY;
-            floatersA[i].enabled = false;
+            floatersA.x[i] = -1000.0f;
+            floatersA.y[i] = -1000.0f;
+            floatersA.v_x[i] = 0;
+            floatersA.v_y[i] = 0;
+            floatersA.mass[i] = PARTICLE_MASS;
+            floatersA.density[i] = PARTICLE_REFERENCE_DENSITY;
+            floatersA.enabled[i] = false;
         }
 
         // only enable and spawn the desired working fluid
         for(size_t i = 0; i < DESIRED_FLOATERS; i++)
         {
-            floatersA[i].x = (rand() % BUFFER_WORKING-1)+BUFFER_PADDING;
-            floatersA[i].y = (rand() % BUFFER_WORKING-1)+BUFFER_PADDING;
+            floatersA.x[i] = (rand() % (BUFFER_WORKING/2-1))+BUFFER_PADDING+ 50;
+            floatersA.y[i] = (rand() % BUFFER_WORKING/2-1)+BUFFER_PADDING+50;
 
-            floatersA[i].v_x = ((rand() % 50) - 25)/10;
-            floatersA[i].v_y = ((rand() % 50) - 25)/10;
+            floatersA.v_x[i] = ((rand() % 50) - 25)/10;
+            floatersA.v_y[i] = ((rand() % 50) - 25)/10;
 
-            floatersA[i].enabled = true;
+            floatersA.enabled[i] = true;
         }
 
 
@@ -56,38 +71,38 @@ namespace JD::floaters
 
             // Top edge
             for (int x = x0; x < x1 && current_i < FLOATER_AMT; x += PARTICLE_GHOST_DENSITY) {
-                floatersA[current_i].x = (float)x;
-                floatersA[current_i].y = (float)y0;
-                floatersA[current_i].v_x = 0;
-                floatersA[current_i].v_y = 0;
-                floatersA[current_i].enabled = false;
+                floatersA.x[current_i] = (float)x;
+                floatersA.y[current_i] = (float)y0;
+                floatersA.v_x[current_i] = 0;
+                floatersA.v_y[current_i] = 0;
+                floatersA.enabled[current_i] = false;
                 current_i++;
             }
             // Right edge
             for (int y = y0; y < y1 && current_i < FLOATER_AMT; y += PARTICLE_GHOST_DENSITY) {
-                floatersA[current_i].x = (float)x1;
-                floatersA[current_i].y = (float)y;
-                floatersA[current_i].v_x = 0;
-                floatersA[current_i].v_y = 0;
-                floatersA[current_i].enabled = false;
+                floatersA.x[current_i] = (float)x1;
+                floatersA.y[current_i] = (float)y;
+                floatersA.v_x[current_i] = 0;
+                floatersA.v_y[current_i] = 0;
+                floatersA.enabled[current_i] = false;
                 current_i++;
             }
             // Bottom edge
             for (int x = x1; x > x0 && current_i < FLOATER_AMT; x -= PARTICLE_GHOST_DENSITY) {
-                floatersA[current_i].x = (float)x;
-                floatersA[current_i].y = (float)y1;
-                floatersA[current_i].v_x = 0;
-                floatersA[current_i].v_y = 0;
-                floatersA[current_i].enabled = false;
+                floatersA.x[current_i] = (float)x;
+                floatersA.y[current_i] = (float)y1;
+                floatersA.v_x[current_i] = 0;
+                floatersA.v_y[current_i] = 0;
+                floatersA.enabled[current_i] = false;
                 current_i++;
             }
             // Left edge
             for (int y = y1; y > y0 && current_i < FLOATER_AMT; y -= PARTICLE_GHOST_DENSITY) {
-                floatersA[current_i].x = (float)x0;
-                floatersA[current_i].y = (float)y;
-                floatersA[current_i].v_x = 0;
-                floatersA[current_i].v_y = 0;
-                floatersA[current_i].enabled = false;
+                floatersA.x[current_i] = (float)x0;
+                floatersA.y[current_i] = (float)y;
+                floatersA.v_x[current_i] = 0;
+                floatersA.v_y[current_i] = 0;
+                floatersA.enabled[current_i] = false;
                 current_i++;
             }
             shell_idx += PARTICLE_GHOST_DENSITY;
@@ -101,8 +116,8 @@ namespace JD::floaters
     {
         for(size_t i = 0; i < FLOATER_AMT; i++)
         {
-            int px = (int)floatersA[i].x;
-            int py = (int)floatersA[i].y;
+            int px = (int)floatersA.x[i];
+            int py = (int)floatersA.y[i];
             
             if (px >= 0 && px < BUFFER_WIDTH && py >= 0 && py < BUFFER_HEIGHT) {
                 int idx = px * BYTES_PER_PIXEL + py * BUFFER_WIDTH * BYTES_PER_PIXEL;

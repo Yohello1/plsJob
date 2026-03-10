@@ -44,6 +44,30 @@ struct floater {
     bool enabled; // true: enabled, false: disabled
 };
 
+struct floaters_soa {
+    float* density;
+
+    float* p_x;
+    float* p_y;
+
+    float* x;
+    float* y;
+
+    float* v_x;
+    float* v_y;
+
+    float* v_x_h;
+    float* v_y_h;
+
+    float* a_x;
+    float* a_y;
+
+    float* mass;
+    float* pressure;
+
+    bool* enabled;
+};
+
 struct force {
     float x;
     float y;

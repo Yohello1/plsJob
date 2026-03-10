@@ -55,7 +55,7 @@ void simulateFloaters()
 int main() {
     JD::graphics::initGrid();
     JD::floaters::init();
-    srand(100);
+    srand(time(NULL));
 
     std::cout << "BUFFER_LINE: " << BUFFER_LINE << std::endl;
     std::cout << "DISTANCE_BETWEEN_POINTS: " << DISTANCE_BETWEEN_POINTS << std::endl;

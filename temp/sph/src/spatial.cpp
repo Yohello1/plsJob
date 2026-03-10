@@ -15,8 +15,8 @@ namespace JD::spatial
 
         for(size_t i = 0; i < FLOATER_AMT; i++)
         {
-            int gx = (JD::floaters::floatersA[i].x) / DISTANCE_BETWEEN_POINTS;
-            int gy = (JD::floaters::floatersA[i].y) / DISTANCE_BETWEEN_POINTS;
+            int gx = (JD::floaters::floatersA.x[i]) / DISTANCE_BETWEEN_POINTS;
+            int gy = (JD::floaters::floatersA.y[i]) / DISTANCE_BETWEEN_POINTS;
 
             if (gx >= 0 && gx < BUFFER_LINE && gy >= 0 && gy < BUFFER_LINE) {
                 int idx = gx + gy * BUFFER_LINE;
@@ -52,8 +52,8 @@ namespace JD::spatial
         std::memset(_curr_pos, 0, sizeof(uint32_t)*BUFFER_LINE*BUFFER_LINE);
         for(size_t i = 0; i < FLOATER_AMT; i++)
         {
-            int gx = (JD::floaters::floatersA[i].x) / DISTANCE_BETWEEN_POINTS;
-            int gy = (JD::floaters::floatersA[i].y) / DISTANCE_BETWEEN_POINTS;
+            int gx = (JD::floaters::floatersA.x[i]) / DISTANCE_BETWEEN_POINTS;
+            int gy = (JD::floaters::floatersA.y[i]) / DISTANCE_BETWEEN_POINTS;
 
             if (gx >= 0 && gx < BUFFER_LINE && gy >= 0 && gy < BUFFER_LINE) {
                 int idx = gx + gy * BUFFER_LINE;

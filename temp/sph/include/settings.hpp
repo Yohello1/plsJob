@@ -38,7 +38,7 @@ const int WINDOW_HEIGHT = 784;
 inline const float PARTICLE_SIZE = INFLUENCE_RADIUS * DISTANCE_BETWEEN_POINTS; // kernel radius px
 inline const float PARTICLE_TIME_STEP = 0.5f;           // smaller step = more stable
 inline const float PARTICLE_REFERENCE_DENSITY = 0.015f;  // target resting density
-inline const float PARTICLE_BULK_MODULUS = 20.0f;       // lower = softer / less explosive
+inline const float PARTICLE_BULK_MODULUS = 10.0f;       // lower = softer / less explosive
 inline const float PARTICLE_VISCOSITY = 0.5f;           // reduced damping for more fluid motion
 inline const float PARTICLE_GRAVITY = 0.5f;
 inline const float PARTICLE_MASS = 1.0f;                // normalised mass; pressure formula handles scaling
@@ -46,14 +46,15 @@ inline const float PARTICLE_MASS = 1.0f;                // normalised mass; pres
 // until i learn how to write code :(
 inline const float PARTICLE_MAX_V = 7.5f;
 inline const float PARTICLE_RESTITUTION = 0.9f;
-inline const int PARTICLE_GHOST_DENSITY = 2;
+inline const int PARTICLE_GHOST_DENSITY = 1;
 
 // am I even using these?
 inline const int PARTICLE_N_FRAMES = 0; // Number of frames
 inline const int PARTICLE_NP_FRAMES = 0; // Steps per frame
 
 // coeffs
-inline const float PARTICLE_VISCOSITY_K_COEFF = 45.0f/std::numbers::pi_v<float> * 0.1; 
+inline const float PARTICLE_VISCOSITY_K_COEFF = 45.0f/std::numbers::pi_v<float> * 1.00000; 
+inline const float PARTICLE_SPIKY_K = -45.0f / (std::numbers::pi_v<float> * std::pow(PARTICLE_SIZE, 6)); 
 
 
 

@@ -15,7 +15,7 @@ void JD::Spiky_k::gradient(float dx, float dy, float distance_i, float particle_
 
     float diff = h - std::sqrt(distance_i);
 
-    float coeff = -45.0f / (std::numbers::pi_v<float> * std::pow(h, 6));
+    float coeff = PARTICLE_SPIKY_K;
 
     float scalar = (coeff * diff * diff) * JD::math::rsqrt(distance_i) ;
     out_force.x = scalar * dx;

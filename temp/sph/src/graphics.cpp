@@ -84,10 +84,10 @@ namespace JD::graphics {
     }
 
     void computeStrengths() {
-        floater* __restrict p_floatersA = JD::floaters::floatersA;
+        floaters_soa p_floatersA = JD::floaters::floatersA;
         int* __restrict p_indices = particles_loc;
 
-        for(int i = 0; i < POINTS_AMT; i++) {
+        for(size_t i = 0; i < POINTS_AMT; i++) {
             float strength = 0.0f;
             int x = points[i].i_x;
             int y = points[i].i_y;
@@ -98,17 +98,15 @@ namespace JD::graphics {
 
                 for(int k = 0; k < cells_ctr[idx_r]; k++) {
                     int floater_idx = p_indices[idx_o + k];
-                    float dx = p_floatersA[floater_idx].x - x;
-                    float dy = p_floatersA[floater_idx].y - y;
+                    float dx = p_floatersA.x[floater_idx] - x;
+                    float dy = p_floatersA.y[floater_idx] - y;
                     float dist_sq = dx*dx + dy*dy;
 
                     dist_sq = (dist_sq < 0.001f) ? 0.001f : dist_sq;
-                    strength += (p_floatersA[floater_idx].density) * (1.0f / dist_sq);
+                    strength += (p_floatersA.density[floater_idx]) * (1.0f / dist_sq);
                 }
             }
             points[i].strength = strength;
-            //if(strength > THRESHOLD) {std::cout << "hot";}
-            std::cout << strength << ' ';
         }
         std::cout << '\n';
     }

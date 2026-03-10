@@ -12,5 +12,5 @@ float JD:: Viscosity_k::laplacian(float distance_i, float particle_size_i)
 
     float coeff = (1/( std::pow(h, 6))) * PARTICLE_VISCOSITY_K_COEFF;
 
-    return coeff * (h - std::sqrt(distance_i));
+    return coeff * (h - std::sqrt(distance_i)) * 0;
 }

@@ -24,7 +24,7 @@ namespace JD::floaters
         uint32_t regions[BLOCK_NEIGHBOR_COUNT];
     };
 
-    extern floater* floatersA;
+    extern floaters_soa floatersA;
     extern block*   blocks; 
 
     void init();
