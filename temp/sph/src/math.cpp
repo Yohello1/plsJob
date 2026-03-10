@@ -1,4 +1,6 @@
 #include "math.hpp"
+
+#include <immintrin.h>
 #include <cmath>
 #include <vector>
 
@@ -31,19 +33,14 @@ namespace JD::math {
     // Posted by user2344271
     // Retrieved 2026-02-12, License - CC BY-SA 4.0
     float rsqrt( float number ){
-        union {
-            float f;
-            uint32_t i;
-        } conv;
+        float res;
+        _mm_store_ss(&res, _mm_rsqrt_ss(_mm_set_ss(number)));
+        return res;
 
-        float x2;
-        const float threehalfs = 1.5F;
+    }
 
-        x2 = number * 0.5F;
-        conv.f  = number;
-        conv.i  = 0x5f3759df - ( conv.i >> 1 );
-        conv.f  = conv.f * ( threehalfs - ( x2 * conv.f * conv.f ) );
-        return conv.f;
+    float ffast_max(float a, float b) {
+        return (a > b) ? a : b;
     }
 
 

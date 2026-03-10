@@ -8,7 +8,7 @@
 
 inline constexpr int DISTANCE_BETWEEN_POINTS = 8;
 
-inline constexpr int SIZE_MULTIPLIER = 30;
+inline constexpr int SIZE_MULTIPLIER = 120;
 inline constexpr int INFLUENCE_RADIUS = 4; // kernel look-ahead in grid cells; increase for more particle sensitivity
 inline constexpr int PADDING = std::max(INFLUENCE_RADIUS+1, INFLUENCE_RADIUS+1);
 

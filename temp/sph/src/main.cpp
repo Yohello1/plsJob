@@ -9,9 +9,10 @@
 #include "gravity.hpp"
 #include "math.hpp"
 #include "spiky_k.hpp"
+
+#include <immintrin.h>
 #include <SDL2/SDL.h>
 #include <omp.h>
-
 #include <cstring>
 #include <iostream>
 #include <iomanip>

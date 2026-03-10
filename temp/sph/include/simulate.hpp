@@ -233,8 +233,8 @@ namespace JD::simulate
                                 force grad_f;
                                 KernelGrad(dx, dy, r_sq, h_in, grad_f);
 
-                                float rho_i = std::max(particles_in.density[i], 1e-6f);
-                                float rho_j = std::max(particles_in.density[j], 1e-6f);
+                                float rho_i = JD::math::ffast_max(particles_in.density[i], 1e-6f);
+                                float rho_j = JD::math::ffast_max(particles_in.density[j], 1e-6f);
                                 
                                 // monagham thingy ma bober to fix the pressure going BOOM
                                 // F_ij = -m_j * (P_i + P_j) / (rho_i * rho_j) * grad_W

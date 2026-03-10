@@ -12,6 +12,7 @@ namespace JD::math {
     float fdistEuclid(std::vector<float> a, std::vector<float> b);
     std::pair<int, int> getMidPoint(const point& p0, const point& p1);
     float rsqrt(float number);
+    float ffast_max(float a, float b);
 } // namespace JD::math
 
 #endif
