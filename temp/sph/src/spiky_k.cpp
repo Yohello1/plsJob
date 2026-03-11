@@ -4,20 +4,19 @@
 #include "spiky_k.hpp"
 #include "math.hpp"
 
-void JD::Spiky_k::gradient(float dx, float dy, float distance_i, float particle_size_i, force& out_force)
-{
-    float h = particle_size_i;
+void JD::Spiky_k::gradient(float dx, float dy, float dist_sq, float h, force& out_force) {
     float h2 = h * h;
-    if (distance_i <= 0 || distance_i >= h2) {
-        out_force.x = 0.0f; out_force.y = 0.0f;
+    if (dist_sq <= 0.0f || dist_sq >= h2) {
+        out_force = {0.0f, 0.0f};
         return;
     }
 
-    float diff = h - std::sqrt(distance_i);
+    float dist = std::sqrt(dist_sq);
+    float inv_dist = 1.0f / dist;
 
-    float coeff = PARTICLE_SPIKY_K;
+    float diff = h - dist;
+    float scalar = (PARTICLE_SPIKY_K * diff * diff) * inv_dist;
 
-    float scalar = (coeff * diff * diff) * JD::math::rsqrt(distance_i) ;
     out_force.x = scalar * dx;
     out_force.y = scalar * dy;
 }

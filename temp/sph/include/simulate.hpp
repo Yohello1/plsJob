@@ -37,7 +37,8 @@ struct SimDiag {
     int near_bottom = 0;
 };
 
-inline SimDiag collectDiagnostics(floaters_soa p, int frame)
+template <typename Particles>
+inline SimDiag collectDiagnostics(const Particles& p, int frame)
 {
     SimDiag d;
     const float lo_x = (float)BUFFER_PADDING;
@@ -122,261 +123,189 @@ inline void printDiagnostics(const SimDiag& d, int frame)
 
 namespace JD::simulate
 {
-    template <auto KernelFunc>
-    void computeDensity(int* offsets_in,
-                        int* cells_ctr_in,
-                        int* particles_loc_in,
-                        int  region_amt,          // should be BLOCK_NEIGHBOR_COUNT
-                        JD::floaters::block* blocks,  
-                        floaters_soa p_floatersA,
-                        float h_in)
+    struct SpatialView {
+        int* offsets;
+        int* counts;
+        int* locs;
+        JD::floaters::block* blocks;
+        int  region_amt;
+        float grid_spacing;
+        int   grid_line;
+
+        template<typename F>
+        inline void for_each_neighbor(float x, float y, F&& func) const {
+            int bx = (int)(x / grid_spacing);
+            int by = (int)(y / grid_spacing);
+            
+            if (bx >= 0 && bx < grid_line && by >= 0 && by < grid_line) {
+                size_t idx = (size_t)(bx + by * grid_line);
+
+                for (int j = 0; j < region_amt; j++) {
+                    int idx_r = (int)blocks[idx].regions[j];
+                    if (idx_r == INT_MAX) continue;
+
+                    int idx_o = offsets[idx_r];
+                    for (int k = 0; k < counts[idx_r]; k++) {
+                        func(locs[idx_o + k]);
+                    }
+                }
+            }
+        }
+    };
+
+    template <auto KernelFunc, typename Particles>
+    void computeDensity(const SpatialView& grid,
+                        Particles& p,
+                        float h)
     {
 #pragma omp parallel for num_threads(16)
         for (size_t i = 0; i < FLOATER_AMT; i++)
         {
-            int bx = (int)(p_floatersA.x[i] / DISTANCE_BETWEEN_POINTS);
-            int by = (int)(p_floatersA.y[i] / DISTANCE_BETWEEN_POINTS);
-            
             float temp = 0.0f;
-            float x    = p_floatersA.x[i];
-            float y    = p_floatersA.y[i];
+            float x    = p.x[i];
+            float y    = p.y[i];
 
-            if (bx >= 0 && bx < BUFFER_LINE && by >= 0 && by < BUFFER_LINE) {
-                size_t idx = (size_t)(bx + by * BUFFER_LINE);
+            grid.for_each_neighbor(x, y, [&](int j) {
+                float dx = p.x[j] - x;
+                float dy = p.y[j] - y;
+                float dist_sq = dx*dx + dy*dy;
+                temp += p.mass[j] * KernelFunc(dist_sq, h);
+            });
 
-                for (int j = 0; j < region_amt; j++)
-                {
-                    int idx_r = (int)blocks[idx].regions[j];
-                    if (idx_r == INT_MAX) { continue; }
+            // ghost are on wall, their densities are a bit higher to 
+            // ya
+            if (!p.enabled[i]) temp *= 8.0f;
 
-                    int idx_o = offsets_in[idx_r];
-
-                    for (int k = 0; k < cells_ctr_in[idx_r]; k++)
-                    {
-                        int floater_idx = particles_loc_in[idx_o + k];
-                        float dx = p_floatersA.x[floater_idx] - x;
-                        float dy = p_floatersA.y[floater_idx] - y;
-                        float dist_sq = dx*dx + dy*dy;
-                    
-                        temp += p_floatersA.mass[floater_idx] * KernelFunc(dist_sq, h_in);
-                    }
-                }
-
-                // ghost are on wall, their densities are a bit higher to 
-                // ya
-                //
-                if (!p_floatersA.enabled[i]) temp *= 8.0f;
-
-                p_floatersA.density[i]  = temp;
-                p_floatersA.pressure[i] = std::max(0.0f,
-                    PARTICLE_BULK_MODULUS * (p_floatersA.density[i] - PARTICLE_REFERENCE_DENSITY));
-            }
+            p.density[i]  = temp;
+            p.pressure[i] = std::max(0.0f,
+                PARTICLE_BULK_MODULUS * (p.density[i] - PARTICLE_REFERENCE_DENSITY));
         }
     }
 
 
-    template <auto KernelGrad>
-    void computePressureForce(int* offsets_in,
-                              int* cells_ctr_in,
-                              int* particles_loc_in,
-                              floaters_soa particles_in,
-                              float h_in)
+    template <auto KernelGrad, typename Particles>
+    void computePressureForce(const SpatialView& grid,
+                              Particles& p,
+                              float h)
     {
 #pragma omp parallel for num_threads(16)
         for (size_t i = 0; i < FLOATER_AMT; i++) {
-            if (!particles_in.enabled[i]) continue; // Ghosts don't receive forces
+            if (!p.enabled[i]) continue; // Ghosts don't receive forces
 
-            float x  = particles_in.x[i];
-            float y  = particles_in.y[i];
-            int   bx = (int)(x / DISTANCE_BETWEEN_POINTS);
-            int   by = (int)(y / DISTANCE_BETWEEN_POINTS);
+            float x  = p.x[i];
+            float y  = p.y[i];
             
-            if (bx >= 0 && bx < BUFFER_LINE && by >= 0 && by < BUFFER_LINE) {
-                size_t idx = (size_t)(bx + by * BUFFER_LINE);
+            grid.for_each_neighbor(x, y, [&](int j) {
+                if (i == (size_t)j) return;
 
-                for (int r = 0; r < JD::floaters::BLOCK_NEIGHBOR_COUNT; r++) {
-                    int idx_r = (int)JD::floaters::blocks[idx].regions[r];
-                    if (idx_r == INT_MAX) continue;
+                float dx    = x - p.x[j];
+                float dy    = y - p.y[j];
+                float r_sq  = dx*dx + dy*dy;
 
-                    int idx_o = offsets_in[idx_r];
-                    for (int k = 0; k < cells_ctr_in[idx_r]; k++) {
-                        int j = particles_loc_in[idx_o + k];
-                        if (i == (size_t)j) continue;
+                float dist = std::sqrt(r_sq);
+                float r_norm = dist/h;
 
-                        float dx    = x - particles_in.x[j];
-                        float dy    = y - particles_in.y[j];
-                        float r_sq  = dx*dx + dy*dy;
+                if (r_sq > 0 && r_sq < h*h) {
+                    if (!p.enabled[j])
+                    {
+                        if(r_norm < PARTICLE_SIZE)
+                        {
+                            float k_repulsion = 30.5 * PARTICLE_BULK_MODULUS;
+                            float force_mag = k_repulsion * (1.0f - r_norm) / (r_sq + 0.01f);
 
-                        float dist = std::sqrt(r_sq);
-                        float r_norm = dist/h_in;
+                            p.a_x[i] += force_mag * (dx / dist);
+                            p.a_y[i] += force_mag * (dy / dist);
+                        
+                            float friction_coeff = 0.1f;
+                            float dvx = p.v_x[i] - p.v_x[j]; 
+                            float dvy = p.v_y[i] - p.v_y[j];
 
-                        if (r_sq > 0 && r_sq < h_in*h_in) {
-                            if (!particles_in.enabled[j])
-                            {
-                                if(r_norm < PARTICLE_SIZE)
-                                {
-                                    float k_repulsion = 30.5 * PARTICLE_BULK_MODULUS;
-                                    float force_mag = k_repulsion * (1.0f - r_norm) / (r_sq + 0.01f);
-
-                                    particles_in.a_x[i] += force_mag * (dx / dist);
-                                    particles_in.a_y[i] += force_mag * (dy / dist);
-                                
-                                    float friction_coeff = 0.1f;
-                                    float dvx = particles_in.v_x[i] - particles_in.v_x[j]; 
-                                    float dvy = particles_in.v_y[i] - particles_in.v_y[j];
-
-                                    particles_in.a_x[i] -= friction_coeff * dvx;
-                                    particles_in.a_y[i] -= friction_coeff * dvy;
-                                }
-                            }
-                            else {
-                                force grad_f;
-                                KernelGrad(dx, dy, r_sq, h_in, grad_f);
-
-                                float rho_i = JD::math::ffast_max(particles_in.density[i], 1e-6f);
-                                float rho_j = JD::math::ffast_max(particles_in.density[j], 1e-6f);
-                                
-                                // monagham thingy ma bober to fix the pressure going BOOM
-                                // F_ij = -m_j * (P_i + P_j) / (rho_i * rho_j) * grad_W
-                                // Using (P_i+P_j)/(rho_i*rho_j) instead of P/rho^2 keeps
-
-                                float p_i = particles_in.pressure[i];
-                                float p_j;
-                                p_j = (!particles_in.enabled[j]) ? p_i * 1.0f : particles_in.pressure[j];
-
-                                float p_term = (p_i + p_j) / (rho_i * rho_j);
-
-                                particles_in.a_x[i] -= particles_in.mass[j] * p_term * grad_f.x;
-                                particles_in.a_y[i] -= particles_in.mass[j] * p_term * grad_f.y;
-                            }
+                            p.a_x[i] -= friction_coeff * dvx;
+                            p.a_y[i] -= friction_coeff * dvy;
                         }
                     }
+                    else {
+                        force grad_f;
+                        KernelGrad(dx, dy, r_sq, h, grad_f);
+
+                        float rho_i = JD::math::ffast_max(p.density[i], 1e-6f);
+                        float rho_j = JD::math::ffast_max(p.density[j], 1e-6f);
+                        
+                        float p_i = p.pressure[i];
+                        float p_j = (!p.enabled[j]) ? p_i * 1.0f : p.pressure[j];
+
+                        float p_term = (p_i + p_j) / (rho_i * rho_j);
+
+                        p.a_x[i] -= p.mass[j] * p_term * grad_f.x;
+                        p.a_y[i] -= p.mass[j] * p_term * grad_f.y;
+                    }
                 }
-            }
+            });
         }
     }
 
-    template <auto KernelLap>
-    void computeViscosity(int* offsets_in,
-                           int* cells_ctr_in,
-                           int* particles_loc_in,
-                           floaters_soa particles_in,
-                           float h_in) {
+    template <auto KernelLap, typename Particles>
+    void computeViscosity(const SpatialView& grid,
+                          Particles& p,
+                          float h) {
 #pragma omp parallel for num_threads(16)
         for (size_t i = 0; i < FLOATER_AMT; i++) {
-            if (!particles_in.enabled[i]) continue;
+            if (!p.enabled[i]) continue;
 
-            float x  = particles_in.x[i];
-            float y  = particles_in.y[i];
-            int   bx = (int)(x / DISTANCE_BETWEEN_POINTS);
-            int   by = (int)(y / DISTANCE_BETWEEN_POINTS);
+            float x  = p.x[i];
+            float y  = p.y[i];
             
-            if (bx >= 0 && bx < BUFFER_LINE && by >= 0 && by < BUFFER_LINE) {
-                size_t idx = (size_t)(bx + by * BUFFER_LINE);
+            grid.for_each_neighbor(x, y, [&](int j) {
+                if (i == (size_t)j) return;
 
-                for (int r = 0; r < JD::floaters::BLOCK_NEIGHBOR_COUNT; r++) {
-                    int idx_r = (int)JD::floaters::blocks[idx].regions[r];
-                    if (idx_r == INT_MAX) continue;
-
-                    int idx_o = offsets_in[idx_r];
-                    for (int k = 0; k < cells_ctr_in[idx_r]; k++) {
-                        int j = particles_loc_in[idx_o + k];
-                        if (i == (size_t)j) continue;
-
-                        float dx   = x - particles_in.x[j];
-                        float dy   = y - particles_in.y[j];
-                        float r_sq = dx*dx + dy*dy;
-                        if (r_sq > 0 && r_sq < h_in*h_in) {
-                            float lap   = KernelLap(r_sq, h_in);
-                            float rho_j = std::max(particles_in.density[j], 1e-6f);
-                            float v_mod = PARTICLE_VISCOSITY * (particles_in.mass[j] / rho_j);
-                            particles_in.a_x[i] += v_mod * (particles_in.v_x[j] - particles_in.v_x[i]) * lap;
-                            particles_in.a_y[i] += v_mod * (particles_in.v_y[j] - particles_in.v_y[i]) * lap;
-                        }
-                    }
+                float dx   = x - p.x[j];
+                float dy   = y - p.y[j];
+                float r_sq = dx*dx + dy*dy;
+                if (r_sq > 0 && r_sq < h*h) {
+                    float lap   = KernelLap(r_sq, h);
+                    float rho_j = std::max(p.density[j], 1e-6f);
+                    float v_mod = PARTICLE_VISCOSITY * (p.mass[j] / rho_j);
+                    p.a_x[i] += v_mod * (p.v_x[j] - p.v_x[i]) * lap;
+                    p.a_y[i] += v_mod * (p.v_y[j] - p.v_y[i]) * lap;
                 }
-            }
+            });
         }
     }
 
     // apply accel to activ
-    template <auto function>
-    void applyYAccelerationToAllParticles(floaters_soa particles_in)
+    template <auto function, typename Particles>
+    void applyYAccelerationToAllParticles(Particles& p)
     {
         float valueToApply = function();
         for (size_t i = 0; i < FLOATER_AMT; i++)
         {
-            if (!particles_in.enabled[i]) break;
-            particles_in.a_y[i] += valueToApply;
+            if (!p.enabled[i]) break;
+            p.a_y[i] += valueToApply;
         }
     }
     
 
-    void integrate(int* offsets_in,
-                   int* cells_ctr_in,
-                   int* particles_loc_in,
-                   floaters_soa particles_in) 
+    template <typename Particles>
+    void integrate(Particles& p) 
     {
-        const float lo_x = (float)BUFFER_PADDING;
-        const float hi_x = (float)(BUFFER_PADDING + BUFFER_WORKING);
-        const float lo_y = (float)BUFFER_PADDING;
-        const float hi_y = (float)(BUFFER_PADDING + BUFFER_WORKING);
-
 #pragma omp parallel for num_threads(16)
         for (size_t i = 0; i < FLOATER_AMT; i++) 
         {
-            if (!particles_in.enabled[i]) continue; // ghosts stay fixed
+            if (!p.enabled[i]) continue; // ghosts stay fixed
 
-            particles_in.v_x[i] += particles_in.a_x[i] * PARTICLE_TIME_STEP; 
-            particles_in.v_y[i] += particles_in.a_y[i] * PARTICLE_TIME_STEP;
+            p.v_x[i] += p.a_x[i] * PARTICLE_TIME_STEP; 
+            p.v_y[i] += p.a_y[i] * PARTICLE_TIME_STEP;
 
             // Velocity clamp – prevents tunnelling through boundaries
-            if (particles_in.v_x[i] >  PARTICLE_MAX_V) particles_in.v_x[i] =  PARTICLE_MAX_V;
-            if (particles_in.v_x[i] < -PARTICLE_MAX_V) particles_in.v_x[i] = -PARTICLE_MAX_V;
-            if (particles_in.v_y[i] >  PARTICLE_MAX_V) particles_in.v_y[i] =  PARTICLE_MAX_V;
-            if (particles_in.v_y[i] < -PARTICLE_MAX_V) particles_in.v_y[i] = -PARTICLE_MAX_V;
+            if (p.v_x[i] >  PARTICLE_MAX_V) p.v_x[i] =  PARTICLE_MAX_V;
+            if (p.v_x[i] < -PARTICLE_MAX_V) p.v_x[i] = -PARTICLE_MAX_V;
+            if (p.v_y[i] >  PARTICLE_MAX_V) p.v_y[i] =  PARTICLE_MAX_V;
+            if (p.v_y[i] < -PARTICLE_MAX_V) p.v_y[i] = -PARTICLE_MAX_V;
 
-            particles_in.x[i] += particles_in.v_x[i] * PARTICLE_TIME_STEP; 
-            particles_in.y[i] += particles_in.v_y[i] * PARTICLE_TIME_STEP;
-            particles_in.a_x[i] = 0; 
-            particles_in.a_y[i] = 0;
-
-            /*
-            
-            // one day
-            // I will
-            // figure out
-            // how to 
-            // make
-            // ghost
-            // particles
-            // work
-            // :D
-            // sadness
-            // this is a band aid right now sadly
-            if (particles_in.x[i] < lo_x) {
-                particles_in.x[i]   = lo_x + (lo_x - particles_in.x[i]);
-                particles_in.v_x[i] = std::abs(particles_in.v_x[i]) * PARTICLE_RESTITUTION;
-            }
-            if (particles_in.x[i] >= hi_x) {
-                particles_in.x[i]   = hi_x - (particles_in.x[i] - hi_x) - 1.0f;
-                particles_in.v_x[i] = -std::abs(particles_in.v_x[i]) * PARTICLE_RESTITUTION;
-            }
-            if (particles_in.y[i] < lo_y) {
-                particles_in.y[i]   = lo_y + (lo_y - particles_in.y[i]);
-                particles_in.v_y[i] = std::abs(particles_in.v_y[i]) * PARTICLE_RESTITUTION;
-            }
-            if (particles_in.y[i] >= hi_y) {
-                particles_in.y[i]   = hi_y - (particles_in.y[i] - hi_y) - 1.0f;
-                particles_in.v_y[i] = -std::abs(particles_in.v_y[i]) * PARTICLE_RESTITUTION;
-            }
-
-            // Final safety clamp: if still out of bounds after reflection,
-            // place back at boundary (extreme edge case only)
-            particles_in.x[i] = std::max(lo_x, std::min(hi_x - 1.0f, particles_in.x[i]));
-            particles_in.y[i] = std::max(lo_y, std::min(hi_y - 1.0f, particles_in.y[i]));
-            */
-            
+            p.x[i] += p.v_x[i] * PARTICLE_TIME_STEP; 
+            p.y[i] += p.v_y[i] * PARTICLE_TIME_STEP;
+            p.a_x[i] = 0; 
+            p.a_y[i] = 0;
         }
     }
 }

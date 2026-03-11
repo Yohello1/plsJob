@@ -14,7 +14,7 @@ OBJS = $(SRCS:$(SRC_DIR)/%.cpp=$(OBJ_DIR)/%.o)
 
 # 4. Flags
 # -I$(INC_DIR) tells the compiler to look in the include folder for .hpp files
-CFLAGS = -std=c++20 -Ofast -ffast-math -march=native -fopenmp -Wall -I$(INC_DIR)
+CFLAGS = -std=c++20 -Ofast -ffast-math -march=native -mrecip -fopenmp -Wall -I$(INC_DIR)
 LDFLAGS = `sdl2-config --cflags --libs` -lSDL2_image -lpthread -fopenmp -flto
 
 # Default Target

@@ -121,7 +121,9 @@ namespace JD::floaters
             
             if (px >= 0 && px < BUFFER_WIDTH && py >= 0 && py < BUFFER_HEIGHT) {
                 int idx = px * BYTES_PER_PIXEL + py * BUFFER_WIDTH * BYTES_PER_PIXEL;
-                JD::graphics::static_rgb_buffer[idx+1] = 250;
+                JD::graphics::static_rgb_buffer[idx+0] =(uint8_t)(((floatersA.v_x[i] / (float)PARTICLE_MAX_V) * 0.5f + 0.5f) * 255.0f); 
+                JD::graphics::static_rgb_buffer[idx+1] = (uint8_t)(((floatersA.v_y[i] / (float)PARTICLE_MAX_V) * 0.5f + 0.5f) * 255.0f); 
+                JD::graphics::static_rgb_buffer[idx+2] = 250;
             }
         }
     }

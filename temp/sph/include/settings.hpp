@@ -8,7 +8,7 @@
 
 inline constexpr int DISTANCE_BETWEEN_POINTS = 8;
 
-inline constexpr int SIZE_MULTIPLIER = 120;
+inline constexpr int SIZE_MULTIPLIER = 30;
 inline constexpr int INFLUENCE_RADIUS = 4; // kernel look-ahead in grid cells; increase for more particle sensitivity
 inline constexpr int PADDING = std::max(INFLUENCE_RADIUS+1, INFLUENCE_RADIUS+1);
 
@@ -36,7 +36,7 @@ const int WINDOW_HEIGHT = 784;
 //   actual resting density ≈ 0.18 (Poly6 self-contribution * neighbour count)
 //   keep reference density close to expected resting density to minimise rest pressure
 inline const float PARTICLE_SIZE = INFLUENCE_RADIUS * DISTANCE_BETWEEN_POINTS; // kernel radius px
-inline const float PARTICLE_TIME_STEP = 0.5f;           // smaller step = more stable
+inline const float PARTICLE_TIME_STEP = 0.25f;           // smaller step = more stable
 inline const float PARTICLE_REFERENCE_DENSITY = 0.015f;  // target resting density
 inline const float PARTICLE_BULK_MODULUS = 10.0f;       // lower = softer / less explosive
 inline const float PARTICLE_VISCOSITY = 0.5f;           // reduced damping for more fluid motion
