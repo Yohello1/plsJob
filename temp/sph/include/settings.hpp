@@ -53,9 +53,9 @@ inline const int PARTICLE_N_FRAMES = 0; // Number of frames
 inline const int PARTICLE_NP_FRAMES = 0; // Steps per frame
 
 // coeffs
-inline const float PARTICLE_VISCOSITY_K_COEFF = 45.0f/std::numbers::pi_v<float> * 1.00000; 
+inline const float PARTICLE_VISCOSITY_K_COEFF = 45.0f/std::numbers::pi_v<float>; 
 inline const float PARTICLE_SPIKY_K = -45.0f / (std::numbers::pi_v<float> * std::pow(PARTICLE_SIZE, 6)); 
-
+inline const float PARTICLE_POLY6_K_SMOOTHING = 315.0f / (64.0f * std::numbers::pi_v<float> * PARTICLE_SIZE*PARTICLE_SIZE*PARTICLE_SIZE*PARTICLE_SIZE*PARTICLE_SIZE*PARTICLE_SIZE*PARTICLE_SIZE*PARTICLE_SIZE*PARTICLE_SIZE);
 
 
 inline const float GRAVITY_CONSTANT = 0.1f;

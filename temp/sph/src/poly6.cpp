@@ -3,6 +3,7 @@
 #include "struct.hpp"
 #include "poly6.hpp"
 
+/*
 float JD::Poly6_k::smoothing(float distance_i, float particle_size_i)
 {
     float h = particle_size_i;
@@ -46,3 +47,5 @@ float JD::Poly6_k::laplacian(float distance_i, float particle_size_i) {
 
     return coeff * -6.0f * (3.0f * h2 * h2 - 10.0f * h2 * r2 + 7.0f * r2 * r2);
 }
+
+*/
