@@ -133,14 +133,14 @@ namespace JD::simulate
     {
         for(size_t i = 0; i < FLOATER_AMT; i++)
         {
-            if (!particles_in.enabled[i]) continue; // Ghosts don't receive forces
+            // if (!particles_in.enabled[i]) continue; // Ghosts don't receive forces
 
             float x  = particles_in.x[i];
             float y  = particles_in.y[i];
             int   bx = (int)(x / DISTANCE_BETWEEN_POINTS);
             int   by = (int)(y / DISTANCE_BETWEEN_POINTS);
 
-            int temp = 0.0f;
+            float temp = 0.0f;
             
             if (bx >= 0 && bx < BUFFER_LINE && by >= 0 && by < BUFFER_LINE) {
                 size_t idx = (size_t)(bx + by * BUFFER_LINE);
@@ -220,7 +220,7 @@ namespace JD::simulate
     {
 #pragma omp parallel for num_threads(16)
         for (size_t i = 0; i < FLOATER_AMT; i++) {
-            if (!particles_in.enabled[i]) continue; // Ghosts don't receive forces
+            // if (!particles_in.enabled[i]) continue; // Ghosts don't receive forces
 
             float x  = particles_in.x[i];
             float y  = particles_in.y[i];
@@ -251,8 +251,7 @@ namespace JD::simulate
                             {
                                 if(r_norm < PARTICLE_SIZE)
                                 {
-                                    float k_repulsion = 30.5 * PARTICLE_BULK_MODULUS;
-                                    float force_mag = k_repulsion * (1.0f - r_norm) / (r_sq + 0.01f);
+                                    float force_mag = PARTICLE_REPULSION * (1.0f - r_norm) / (r_sq + 0.01f);
 
                                     particles_in.a_x[i] += force_mag * (dx / dist);
                                     particles_in.a_y[i] += force_mag * (dy / dist);
@@ -300,7 +299,7 @@ namespace JD::simulate
                            float h_in) {
 #pragma omp parallel for num_threads(16)
         for (size_t i = 0; i < FLOATER_AMT; i++) {
-            if (!particles_in.enabled[i]) continue;
+            // if (!particles_in.enabled[i]) continue;
 
             float x  = particles_in.x[i];
             float y  = particles_in.y[i];
@@ -343,8 +342,9 @@ namespace JD::simulate
         std::cout << "cat: " << valueToApply << '\n';
         for (size_t i = 0; i < FLOATER_AMT; i++)
         {
-            if (!particles_in.enabled[i]) break;
-            particles_in.a_y[i] += valueToApply;
+            if (particles_in.enabled[i]) {
+                particles_in.a_y[i] += valueToApply;
+            }
         }
     }
     
@@ -361,7 +361,7 @@ namespace JD::simulate
             if (!particles_in.enabled[i]) continue; // ghosts stay fixed
 
             particles_in.v_x[i] += particles_in.a_x[i] * PARTICLE_TIME_STEP; 
-            particles_in.v_y[i] += particles_in.a_y[i] * PARTICLE_TIME_STEP -10000;
+            particles_in.v_y[i] += particles_in.a_y[i] * PARTICLE_TIME_STEP;
 
             // Velocity clamp – prevents tunnelling through boundaries
             if (particles_in.v_x[i] >  PARTICLE_MAX_V) particles_in.v_x[i] =  PARTICLE_MAX_V;
