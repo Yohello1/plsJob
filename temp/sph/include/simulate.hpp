@@ -165,7 +165,7 @@ namespace JD::simulate
                 // ghost are on wall, their densities are a bit higher to 
                 // ya
                 //
-                if (!p_floatersA.enabled[i]) temp *= 8.0f;
+                if (!p_floatersA.enabled[i]) temp *= 1.0f;
 
                 p_floatersA.density[i]  = temp;
                 p_floatersA.pressure[i] = std::max(0.0f,
