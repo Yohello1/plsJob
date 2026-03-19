@@ -128,10 +128,45 @@ namespace JD::simulate
                         int* particles_loc_in,
                         int  region_amt,          // should be BLOCK_NEIGHBOR_COUNT
                         JD::floaters::block* blocks,  
-                        floaters_soa p_floatersA,
+                        floaters_soa particles_in,
                         float h_in)
     {
-#pragma omp parallel for num_threads(16)
+        for(size_t i = 0; i < FLOATER_AMT; i++)
+        {
+            if (!particles_in.enabled[i]) continue; // Ghosts don't receive forces
+
+            float x  = particles_in.x[i];
+            float y  = particles_in.y[i];
+            int   bx = (int)(x / DISTANCE_BETWEEN_POINTS);
+            int   by = (int)(y / DISTANCE_BETWEEN_POINTS);
+
+            int temp = 0.0f;
+            
+            if (bx >= 0 && bx < BUFFER_LINE && by >= 0 && by < BUFFER_LINE) {
+                size_t idx = (size_t)(bx + by * BUFFER_LINE);
+
+                for (int r = 0; r < JD::floaters::BLOCK_NEIGHBOR_COUNT; r++) {
+                    int idx_r = (int)JD::floaters::blocks[idx].regions[r];
+                    if (idx_r == INT_MAX) continue;
+
+                    int idx_o = offsets_in[idx_r];
+                    for (int k = 0; k < cells_ctr_in[idx_r]; k++) 
+                    {
+                        int floater_idx = particles_loc_in[idx_o + k];
+                        float dx = particles_in.x[floater_idx] - x;
+                        float dy = particles_in.y[floater_idx] - y;
+                        float dist_sq = dx*dx + dy*dy;
+                    
+                        temp += particles_in.mass[floater_idx] * KernelFunc(dist_sq, h_in);
+                    }
+                }
+            }
+
+            particles_in.density[i]  = temp;
+            particles_in.pressure[i] = std::max(0.0f,
+                PARTICLE_BULK_MODULUS * (particles_in.density[i] - PARTICLE_REFERENCE_DENSITY));
+        }
+        /*
         for (size_t i = 0; i < FLOATER_AMT; i++)
         {
             int bx = (int)(p_floatersA.x[i] / DISTANCE_BETWEEN_POINTS);
@@ -172,6 +207,7 @@ namespace JD::simulate
                     PARTICLE_BULK_MODULUS * (p_floatersA.density[i] - PARTICLE_REFERENCE_DENSITY));
             }
         }
+        */
     }
 
 
@@ -304,6 +340,7 @@ namespace JD::simulate
     void applyYAccelerationToAllParticles(floaters_soa particles_in)
     {
         float valueToApply = function();
+        std::cout << "cat: " << valueToApply << '\n';
         for (size_t i = 0; i < FLOATER_AMT; i++)
         {
             if (!particles_in.enabled[i]) break;
@@ -317,10 +354,6 @@ namespace JD::simulate
                    int* particles_loc_in,
                    floaters_soa particles_in) 
     {
-        const float lo_x = (float)BUFFER_PADDING;
-        const float hi_x = (float)(BUFFER_PADDING + BUFFER_WORKING);
-        const float lo_y = (float)BUFFER_PADDING;
-        const float hi_y = (float)(BUFFER_PADDING + BUFFER_WORKING);
 
 #pragma omp parallel for num_threads(16)
         for (size_t i = 0; i < FLOATER_AMT; i++) 
@@ -328,7 +361,7 @@ namespace JD::simulate
             if (!particles_in.enabled[i]) continue; // ghosts stay fixed
 
             particles_in.v_x[i] += particles_in.a_x[i] * PARTICLE_TIME_STEP; 
-            particles_in.v_y[i] += particles_in.a_y[i] * PARTICLE_TIME_STEP;
+            particles_in.v_y[i] += particles_in.a_y[i] * PARTICLE_TIME_STEP -10000;
 
             // Velocity clamp – prevents tunnelling through boundaries
             if (particles_in.v_x[i] >  PARTICLE_MAX_V) particles_in.v_x[i] =  PARTICLE_MAX_V;

@@ -39,8 +39,8 @@ inline const float PARTICLE_SIZE = INFLUENCE_RADIUS * DISTANCE_BETWEEN_POINTS; /
 inline const float PARTICLE_TIME_STEP = 0.5f;           // smaller step = more stable
 inline const float PARTICLE_REFERENCE_DENSITY = 0.015f;  // target resting density
 inline const float PARTICLE_BULK_MODULUS = 10.0f;       // lower = softer / less explosive
-inline const float PARTICLE_VISCOSITY = 0.5f;           // reduced damping for more fluid motion
-inline const float PARTICLE_GRAVITY = 0.5f;
+inline const float PARTICLE_VISCOSITY = 1.5f;           // reduced damping for more fluid motion
+inline const float PARTICLE_GRAVITY = 90.0f;
 inline const float PARTICLE_MASS = 1.0f;                // normalised mass; pressure formula handles scaling
 
 // until i learn how to write code :(
@@ -53,18 +53,13 @@ inline const int PARTICLE_N_FRAMES = 0; // Number of frames
 inline const int PARTICLE_NP_FRAMES = 0; // Steps per frame
 
 // coeffs
-inline const float PARTICLE_VISCOSITY_K_COEFF = 45.0f/std::numbers::pi_v<float> * 1.00000; 
+inline const float PARTICLE_VISCOSITY_K_COEFF = 150.0f/std::numbers::pi_v<float> * 1.00000; 
 inline const float PARTICLE_SPIKY_K = -45.0f / (std::numbers::pi_v<float> * std::pow(PARTICLE_SIZE, 6)); 
 
-
-inline constexpr size_t DESIRED_FLOATERS = 100000;
-inline constexpr size_t GHOST_FLOATERS = 200000;  // should be a function/equation but I cannot rn make it up
-                                                  // siracha at 3:45am
+inline constexpr size_t DESIRED_FLOATERS = 10000;
+inline constexpr size_t GHOST_FLOATERS = 200000;  // should be a function/equation but I cannot rn make it up - siracha at 3:45am
 inline constexpr size_t FLOATER_AMT = DESIRED_FLOATERS + GHOST_FLOATERS;  
 inline constexpr int FLOATER_SPEED = 3;
-
-
-inline const float GRAVITY_CONSTANT = 0.1f;
 
 constexpr int CELL_SIZE = DISTANCE_BETWEEN_POINTS*DISTANCE_BETWEEN_POINTS;
 
