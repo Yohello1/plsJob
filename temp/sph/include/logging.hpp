@@ -9,7 +9,7 @@
 #include <string> 
 namespace JD::logging
 {
-    void init(std::string loggingDir);
+    void init();
     
     // Ok as modular & customisable as I want to make this
     // I need to be realisitc with how much time I can spend onthis

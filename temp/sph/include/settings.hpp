@@ -8,7 +8,7 @@
 
 inline constexpr int DISTANCE_BETWEEN_POINTS = 8;
 
-inline constexpr int SIZE_MULTIPLIER = 30;
+inline constexpr int SIZE_MULTIPLIER = 90;
 inline constexpr int INFLUENCE_RADIUS = 4; // kernel look-ahead in grid cells; increase for more particle sensitivity
 inline constexpr int PADDING = std::max(INFLUENCE_RADIUS+1, INFLUENCE_RADIUS+1);
 
@@ -39,9 +39,9 @@ inline const float PARTICLE_SIZE = INFLUENCE_RADIUS * DISTANCE_BETWEEN_POINTS; /
 inline const float PARTICLE_TIME_STEP = 0.05f;           // smaller step for stability with high stiffness
 inline const float PARTICLE_REFERENCE_DENSITY = 0.005f;  // slightly below resting for initial expansion
 inline const float PARTICLE_BULK_MODULUS = 2000.0f;     
-inline const float PARTICLE_VISCOSITY = 1.0f;           
+inline const float PARTICLE_VISCOSITY = 0.01f;           
 inline const float PARTICLE_GRAVITY = 10.0f;           
-inline const float PARTICLE_MASS = 05.0f;                // normalised mass; pressure formula handles scaling
+inline const float PARTICLE_MASS = 10.0f;                // normalised mass; pressure formula handles scaling
 inline const float PARTICLE_REPULSION = 10*PARTICLE_BULK_MODULUS;
 // until i learn how to write code :(
 inline const float PARTICLE_MAX_V = 7.5f;
@@ -53,10 +53,10 @@ inline const int PARTICLE_N_FRAMES = 0; // Number of frames
 inline const int PARTICLE_NP_FRAMES = 0; // Steps per frame
 
 // coeffs
-inline const float PARTICLE_VISCOSITY_K_COEFF = 150.0f/std::numbers::pi_v<float> * 1.00000; 
+inline const float PARTICLE_VISCOSITY_K_COEFF = 10.0f/std::numbers::pi_v<float> * 1.00000; 
 inline const float PARTICLE_SPIKY_K = -45.0f / (std::numbers::pi_v<float> * std::pow(PARTICLE_SIZE, 6)); 
 
-inline constexpr size_t DESIRED_FLOATERS = 8000;
+inline constexpr size_t DESIRED_FLOATERS = 2000;
 inline constexpr size_t GHOST_FLOATERS = 200000;  // should be a function/equation but I cannot rn make it up - siracha at 3:45am
 inline constexpr size_t FLOATER_AMT = DESIRED_FLOATERS + GHOST_FLOATERS;  
 inline constexpr int FLOATER_SPEED = 3;

@@ -9,10 +9,12 @@
 #include "gravity.hpp"
 #include "math.hpp"
 #include "spiky_k.hpp"
+#include "logging.hpp"
 #include <SDL2/SDL.h>
 #include <omp.h>
 
 #include <cstring>
+#include <cstdlib>
 #include <iostream>
 #include <iomanip>
 
@@ -52,9 +54,38 @@ void simulateFloaters()
 }
 
 
-int main() {
+int main(int argc, char** argv) {
+    int max_frames = -1;
+    std::vector<JD::floaters::SpawnBox> fluidBoxes;
+    std::vector<JD::floaters::SpawnBox> ghostBoxes;
+
+    if (argc > 1) {
+        // Try to parse max_frames as the first argument if it's a number
+        if (argv[1][0] != '-') {
+            max_frames = std::atoi(argv[1]);
+        }
+    }
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if ((arg == "--fluid" || arg == "-f") && i + 4 < argc) {
+            float x = (float)std::atof(argv[++i]);
+            float y = (float)std::atof(argv[++i]);
+            float w = (float)std::atof(argv[++i]);
+            float h = (float)std::atof(argv[++i]);
+            fluidBoxes.push_back({x, y, w, h});
+        } else if ((arg == "--ghost" || arg == "-g") && i + 4 < argc) {
+            float x = (float)std::atof(argv[++i]);
+            float y = (float)std::atof(argv[++i]);
+            float w = (float)std::atof(argv[++i]);
+            float h = (float)std::atof(argv[++i]);
+            ghostBoxes.push_back({x, y, w, h});
+        }
+    }
+
     JD::graphics::initGrid();
-    JD::floaters::init();
+    JD::floaters::init(-1.0f, -1.0f, fluidBoxes, ghostBoxes);
+    JD::logging::init();
     srand(time(NULL));
 
     std::cout << "BUFFER_LINE: " << BUFFER_LINE << std::endl;
@@ -127,9 +158,9 @@ int main() {
         JD::floaters::drawFloaters();
         JD::spatial::offsetsCreation();
         JD::spatial::computeIndicies();
-        JD::graphics::computeStrengths();
+        // JD::graphics::computeStrengths();
         // copyFloaters(); // not needed in new version!
-        JD::graphics::drawConnections();
+        // JD::graphics::drawConnections();
 
         SDL_BlitSurface(bufferSurface, &viewRect, screenSurface, nullptr);
         SDL_UpdateWindowSurface(window);
@@ -139,10 +170,12 @@ int main() {
 
         
         static int frame_num = 0;
-        
-         if (frame_num % 10 == 0) {  // print every 10 frames to avoid spam
-            SimDiag diag = collectDiagnostics(JD::floaters::floatersA, frame_num);
-            printDiagnostics(diag, frame_num);
+        if (max_frames > 0 && frame_num >= max_frames) quit = true;
+
+        if (frame_num % (int)(1/PARTICLE_TIME_STEP) == 0) {  // print every 20 frames (1 second) to avoid spam
+//            SimDiag diag = collectDiagnostics(JD::floaters::floatersA, frame_num);
+//            printDiagnostics(diag, frame_num);
+//            JD::logging::log(frame_num);
         }
         
         frame_num++;
@@ -157,7 +190,7 @@ int main() {
         std::cout << "NAME:" <<  frame_name << '\n';
         frame_name += ".ppm";
         std::cout << "NAME:" << frame_name << '\n';
-//         JD::graphics::outputPPM(BUFFER_HEIGHT, BUFFER_WIDTH, frame_name);
+        // JD::graphics::outputPPM(BUFFER_HEIGHT, BUFFER_WIDTH, frame_name);
     }
 
     SDL_FreeSurface(bufferSurface);
