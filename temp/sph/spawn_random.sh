@@ -141,5 +141,5 @@ case $SCENARIO in
     ;;
 esac
 
-echo "Executing: ./draw2 $FLUID_ARGS $GHOST_ARGS"
-./draw2 $FLUID_ARGS $GHOST_ARGS
+echo "Executing: ./draw2 10000 --headless $FLUID_ARGS $GHOST_ARGS"
+./draw2 10000 --headless $FLUID_ARGS $GHOST_ARGS
