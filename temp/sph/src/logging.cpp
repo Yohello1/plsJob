@@ -49,21 +49,26 @@ namespace JD::logging
         std::vector<float> sum_vx(N_W * N_H, 0.0f);
         std::vector<float> sum_vy(N_W * N_H, 0.0f);
         std::vector<int> count(N_W * N_H, 0);
+        std::vector<int> mask(N_W * N_H, 0);
 
         auto& f = JD::floaters::floatersA;
 
         for (size_t p_idx = 0; p_idx < FLOATER_AMT; ++p_idx) {
-            if (!f.enabled[p_idx]) continue;
-
             int px = static_cast<int>(f.x[p_idx]);
             int py = static_cast<int>(f.y[p_idx]);
 
             if (px >= 0 && px < N_W && py >= 0 && py < N_H) {
                 int idx = py * N_W + px;
-                sum_d[idx] += f.density[p_idx];
-                sum_vx[idx] += f.v_x[p_idx];
-                sum_vy[idx] += f.v_y[p_idx];
-                count[idx]++;
+                if (f.enabled[p_idx]) {
+                    sum_d[idx] += f.density[p_idx];
+                    sum_vx[idx] += f.v_x[p_idx];
+                    sum_vy[idx] += f.v_y[p_idx];
+                    count[idx]++;
+                }
+                
+                if (p_idx >= DESIRED_FLOATERS) {
+                    mask[idx] = 1;
+                }
             }
         }
 
@@ -98,7 +103,7 @@ namespace JD::logging
 
         // Mask
         write_csv("m", [&](int idx) {
-            return count[idx] > 0 ? 1 : 0;
+            return mask[idx];
         });
     }
 }
