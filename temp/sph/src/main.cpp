@@ -10,13 +10,16 @@
 #include "math.hpp"
 #include "spiky_k.hpp"
 #include "logging.hpp"
+#ifdef USE_SDL
 #include <SDL2/SDL.h>
+#endif
 #include <omp.h>
 
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
 #include <iomanip>
+#include <random>
 
 void simulateFloaters()
 {
@@ -63,6 +66,10 @@ int main(int argc, char** argv) {
     }
 
     bool headless = false;
+#ifndef USE_SDL
+    headless = true;
+#endif
+
     // parsing!
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -101,6 +108,7 @@ int main(int argc, char** argv) {
 
     std::cout << std::fixed << std::setprecision(2);
 
+#ifdef USE_SDL
     SDL_Window* window = nullptr;
     SDL_Surface* screenSurface = nullptr;
     SDL_Surface* bufferSurface = nullptr;
@@ -137,14 +145,18 @@ int main(int argc, char** argv) {
         viewRect.w = WINDOW_WIDTH;
         viewRect.h = WINDOW_HEIGHT;
     }
+#endif
 
     bool quit = false;
+#ifdef USE_SDL
     SDL_Event e;
+#endif
     clock_t start, end;
 
     while (!quit) {
         start = clock();
 
+#ifdef USE_SDL
         if (!headless) {
             while (SDL_PollEvent(&e) != 0) {
                 if (e.type == SDL_QUIT) quit = true;
@@ -167,21 +179,23 @@ int main(int argc, char** argv) {
             memset(JD::graphics::static_rgb_buffer, 0, (size_t)BUFFER_HEIGHT * BUFFER_WIDTH * BYTES_PER_PIXEL);
             JD::floaters::drawFloaters();
         }
+#endif
 
         JD::spatial::offsetsCreation();
         JD::spatial::computeIndicies();
 
+#ifdef USE_SDL
         if (!headless) {
             SDL_BlitSurface(bufferSurface, &viewRect, screenSurface, nullptr);
             SDL_UpdateWindowSurface(window);
         }
+#endif
 
         simulateFloaters();
 
         static int frame_num = 0;
         if (max_frames > 0 && frame_num >= max_frames) quit = true;
 
-        // Logging enabled for training data (log frequency can be adjusted here)
         if (frame_num % 1 == 0) { 
             JD::logging::log(frame_num);
         }
@@ -201,9 +215,13 @@ int main(int argc, char** argv) {
         // JD::graphics::outputPPM(BUFFER_HEIGHT, BUFFER_WIDTH, frame_name);
     }
 
-    SDL_FreeSurface(bufferSurface);
-    SDL_DestroyWindow(window);
-    SDL_Quit();
+#ifdef USE_SDL
+    if (!headless) {
+        SDL_FreeSurface(bufferSurface);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+    }
+#endif
 
      return 0;
 }
