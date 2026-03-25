@@ -20,6 +20,11 @@ struct point
 
 };
 
+struct SpawnBox
+{
+    float x, y, w, h;
+};
+
 struct floater {
     float density;
 

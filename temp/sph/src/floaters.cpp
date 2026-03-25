@@ -50,21 +50,34 @@ namespace JD::floaters
 
         // fluid spawn
         if (!fluidBoxes.empty()) {
-            size_t particles_per_box = DESIRED_FLOATERS / fluidBoxes.size();
-            for (auto const& box : fluidBoxes) {
-                size_t particles_in_this_box = 0;
-                for (float y = box.y; y < box.y + box.h; y += 2.1f) {
-                    for (float x = box.x; x < box.x + box.w; x += 2.1f) {
-                        if (current_fluid_i >= DESIRED_FLOATERS || particles_in_this_box >= particles_per_box) break;
-                        floatersA.x[current_fluid_i] = x;
-                        floatersA.y[current_fluid_i] = y;
+            size_t num_boxes = fluidBoxes.size();
+            for (size_t i = 0; i < num_boxes; ++i) {
+                auto const& box = fluidBoxes[i];
+                size_t particles_to_spawn = (DESIRED_FLOATERS - current_fluid_i) / (num_boxes - i);
+                
+                if (particles_to_spawn == 0) continue;
+                if (box.w <= 0 || box.h <= 0) continue;
+
+                // Calculate number of rows and columns to fill the box with particles_to_spawn
+                // We aim for n_cols / n_rows roughly equal to box.w / box.h
+                int n_cols = (int)std::max(1.0f, std::round(std::sqrt((float)particles_to_spawn * (box.w / box.h))));
+                int n_rows = (int)((particles_to_spawn + n_cols - 1) / n_cols);
+
+                float step_x = box.w / (float)n_cols;
+                float step_y = box.h / (float)n_rows;
+
+                size_t spawned_in_box = 0;
+                for (int r = 0; r < n_rows && spawned_in_box < particles_to_spawn; ++r) {
+                    for (int c = 0; c < n_cols && spawned_in_box < particles_to_spawn; ++c) {
+                        if (current_fluid_i >= DESIRED_FLOATERS) break;
+                        floatersA.x[current_fluid_i] = box.x + (c + 0.5f) * step_x;
+                        floatersA.y[current_fluid_i] = box.y + (r + 0.5f) * step_y;
                         floatersA.v_x[current_fluid_i] = 0;
                         floatersA.v_y[current_fluid_i] = 0;
                         floatersA.enabled[current_fluid_i] = true;
                         current_fluid_i++;
-                        particles_in_this_box++;
+                        spawned_in_box++;
                     }
-                    if (current_fluid_i >= DESIRED_FLOATERS || particles_in_this_box >= particles_per_box) break;
                 }
             }
         } else if (spawn_x >= 0 && spawn_y >= 0) {

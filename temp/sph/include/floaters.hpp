@@ -11,11 +11,6 @@
 
 namespace JD::floaters
 {
-    struct SpawnBox
-    {
-        float x, y, w, h;
-    };
-
     static constexpr inline size_t BLOCK_AMT = BUFFER_LINE*BUFFER_LINE;
     static constexpr inline int BLOCK_NEIGHBOR_DIM   = 2 * INFLUENCE_RADIUS + 1;
     static constexpr inline int BLOCK_NEIGHBOR_COUNT = BLOCK_NEIGHBOR_DIM * BLOCK_NEIGHBOR_DIM;
