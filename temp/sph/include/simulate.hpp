@@ -218,7 +218,7 @@ namespace JD::simulate
                               floaters_soa particles_in,
                               float h_in)
     {
-#pragma omp parallel for num_threads(16)
+#pragma omp parallel for 
         for (size_t i = 0; i < FLOATER_AMT; i++) {
             // if (!particles_in.enabled[i]) continue; // Ghosts don't receive forces
 
@@ -297,7 +297,7 @@ namespace JD::simulate
                            int* particles_loc_in,
                            floaters_soa particles_in,
                            float h_in) {
-#pragma omp parallel for num_threads(16)
+#pragma omp parallel for 
         for (size_t i = 0; i < FLOATER_AMT; i++) {
             // if (!particles_in.enabled[i]) continue;
 
@@ -355,7 +355,7 @@ namespace JD::simulate
                    floaters_soa particles_in) 
     {
 
-#pragma omp parallel for num_threads(16)
+#pragma omp parallel for 
         for (size_t i = 0; i < FLOATER_AMT; i++) 
         {
             if (!particles_in.enabled[i]) continue; // ghosts stay fixed
