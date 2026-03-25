@@ -9,6 +9,7 @@
 #include <random>
 #include <vector>
 #include <filesystem>
+#include <cstdlib>
 
 namespace JD::logging
 {
@@ -27,6 +28,11 @@ namespace JD::logging
         std::uniform_int_distribution<> dis(0, 0xFFFF);
         
         oss << "_" << std::hex << std::setw(4) << std::setfill('0') << dis(gen);
+
+        if (const char* array_id = std::getenv("SLURM_ARRAY_TASK_ID")) {
+            oss << "_task" << array_id;
+        }
+
         return oss.str();
     }
 
