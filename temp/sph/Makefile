@@ -14,7 +14,7 @@ OBJS = $(SRCS:$(SRC_DIR)/%.cpp=$(OBJ_DIR)/%.o)
 
 # 4. Flags
 # -I$(INC_DIR) tells the compiler to look in the include folder for .hpp files
-CFLAGS = -std=c++20 -Ofast -march=native -ftree-vectorize -fvect-cost-model=unlimited -ffast-math -funroll-loops -fopt-info-vec-optimized -flto -fopenmp -Wall -I$(INC_DIR)
+CFLAGS = -std=c++20 -Ofast -march=skylake-avx512 -ftree-vectorize -fvect-cost-model=unlimited -ffast-math -funroll-loops -fopt-info-vec-optimized -flto -fopenmp -Wall -I$(INC_DIR)
 
 # SDL Check
 HAS_SDL := $(shell pkg-config --exists sdl2 SDL2_image && echo yes || echo no)

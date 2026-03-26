@@ -1,1 +1,1 @@
-rm -rf frames obj draw2
+rm -rf frames obj draw2 data

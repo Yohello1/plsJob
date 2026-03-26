@@ -38,7 +38,7 @@ namespace JD::logging
 
     void init()
     {
-        _logging_dir = _get_log_dirname();
+        _logging_dir = "data/" + _get_log_dirname();
         if (!std::filesystem::exists(_logging_dir)) 
         {
             std::filesystem::create_directories(_logging_dir);
@@ -78,38 +78,35 @@ namespace JD::logging
             }
         }
 
-        auto write_csv = [&](const std::string& suffix, auto get_val) {
-            std::string path = _logging_dir + "/" + std::to_string(i) + "_" + suffix + ".csv";
-            std::ofstream ofs(path);
+        auto write_bin = [&](const std::string& suffix, auto get_val) {
+            std::string path = _logging_dir + "/" + std::to_string(i) + "_" + suffix + ".bin";
+            std::ofstream ofs(path, std::ios::binary);
             if (!ofs.is_open()) return;
 
-            ofs << std::fixed << std::setprecision(3);
-            for (int r = 0; r < N_H; ++r) {
-                for (int c = 0; c < N_W; ++c) {
-                    ofs << get_val(r * N_W + c) << (c == N_W - 1 ? "" : ",");
-                }
-                ofs << "\n";
+            for (int j = 0; j < N_H * N_W; ++j) {
+                auto val = get_val(j);
+                ofs.write(reinterpret_cast<const char*>(&val), sizeof(val));
             }
         };
 
         // Density
-        write_csv("d", [&](int idx) {
+        write_bin("d", [&](int idx) {
             return count[idx] > 0 ? sum_d[idx] / count[idx] : 0.0f;
         });
 
         // V_x
-        write_csv("v_x", [&](int idx) {
+        write_bin("v_x", [&](int idx) {
             return count[idx] > 0 ? sum_vx[idx] / count[idx] : 0.0f;
         });
 
         // V_y
-        write_csv("v_y", [&](int idx) {
+        write_bin("v_y", [&](int idx) {
             return count[idx] > 0 ? sum_vy[idx] / count[idx] : 0.0f;
         });
 
         // Mask
-        write_csv("m", [&](int idx) {
-            return mask[idx];
+        write_bin("m", [&](int idx) {
+            return (int)mask[idx];
         });
     }
 }

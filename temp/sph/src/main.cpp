@@ -20,6 +20,7 @@
 #include <iostream>
 #include <iomanip>
 #include <random>
+#include <filesystem>
 
 void simulateFloaters()
 {
@@ -92,6 +93,7 @@ int main(int argc, char** argv) {
 
     JD::graphics::initGrid();
     JD::floaters::init(-1.0f, -1.0f, fluidBoxes, ghostBoxes);
+    std::filesystem::create_directories("data/frames");
     JD::logging::init();
     
     // Robust seeding
@@ -197,7 +199,7 @@ int main(int argc, char** argv) {
         if (max_frames > 0 && frame_num >= max_frames) quit = true;
 
         if (frame_num % 1 == 0) { 
-            JD::logging::log(frame_num);
+           JD::logging::log(frame_num);
         }
         
         frame_num++;
@@ -207,7 +209,7 @@ int main(int argc, char** argv) {
         std::cout << "Frame " << (frame_num-1)
                   << " Time: " << std::fixed << std::setprecision(4) << time_taken << "s" << std::endl;
     
-        std::string frame_name = "frames/";
+        std::string frame_name = "data/frames/";
         frame_name += std::to_string(frame_num);
         std::cout << "NAME:" <<  frame_name << '\n';
         frame_name += ".ppm";
