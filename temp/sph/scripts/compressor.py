@@ -8,8 +8,13 @@ import glob
 import sys
 
 # Constants based on SPH settings (Updated to 400x400)
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 BUFFER_WIDTH = 400
 BUFFER_HEIGHT = 400
+
+# Normalization factors
+DENSITY_NORM = 50.0 # Maps 0.02 max to 1.0
+VELOCITY_NORM = 1.0 / 7.5 # Maps 7.5 max to 1.0
 
 class SPHDataset(Dataset):
     def __init__(self, data_dir):
@@ -35,7 +40,14 @@ class SPHDataset(Dataset):
         path = os.path.join(self.data_dir, f"{frame_idx}_{suffix}.bin")
         data = np.fromfile(path, dtype=dtype)
         data = data.reshape((BUFFER_HEIGHT, BUFFER_WIDTH))
-        return torch.tensor(data, dtype=torch.float32).unsqueeze(0)
+        tensor = torch.tensor(data, dtype=torch.float32).unsqueeze(0)
+        
+        # Apply normalization based on data type
+        if suffix == "d":
+            return tensor * DENSITY_NORM
+        elif suffix.startswith("v"):
+            return tensor * VELOCITY_NORM
+        return tensor
 
     def __getitem__(self, idx):
         prev_idx, curr_idx = self.samples[idx]
@@ -117,9 +129,9 @@ def train(requested_epochs=None):
     # Multi-session data loading logic could be added here
     
     # Scale batch size
-    batch_per_gpu = 16
+    batch_per_gpu = 8 # Reduced from 16 to save memory
     total_batch = max(1, batch_per_gpu * num_gpus)
-    dataloader = DataLoader(dataset, batch_size=total_batch, shuffle=True, num_workers=4)
+    dataloader = DataLoader(dataset, batch_size=total_batch, shuffle=True, num_workers=4, pin_memory=True)
     
     model = FullModel().to(device)
     if num_gpus > 1:
@@ -127,23 +139,30 @@ def train(requested_epochs=None):
         
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
     criterion = nn.MSELoss()
+    scaler = torch.amp.GradScaler('cuda')
 
     epochs = requested_epochs if requested_epochs else 50
     for epoch in range(epochs):
         model.train()
         for p_d, p_v, c_d in dataloader:
             p_d, p_v, c_d = p_d.to(device), p_v.to(device), c_d.to(device)
-            optimizer.zero_grad()
-            output = model(p_d, p_v, c_d)
-            loss = criterion(output, c_d)
-            loss.backward()
-            optimizer.step()
-        print(f"Epoch {epoch+1}/{epochs}, Loss: {loss.item():.8f}")
+            optimizer.zero_grad(set_to_none=True)
+            
+            with torch.amp.autocast('cuda'):
+                output = model(p_d, p_v, c_d)
+                loss = criterion(output, c_d)
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        
+        # Reports normalized MSE
+        print(f"Epoch {epoch+1}/{epochs}, Normalized Loss: {loss.item():.8f}")
         torch.save(model.state_dict(), "best_model.pth")
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=10)
-    args = parser.parse_argument_group().parse_args()
+    args = parser.parse_args()
     train(args.epochs)

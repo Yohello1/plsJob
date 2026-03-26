@@ -39,21 +39,21 @@ inline const float PARTICLE_SIZE = INFLUENCE_RADIUS * DISTANCE_BETWEEN_POINTS; /
 inline const float PARTICLE_TIME_STEP = 0.05f;           // smaller step for stability with high stiffness
 inline const float PARTICLE_REFERENCE_DENSITY = 0.005f;  // slightly below resting for initial expansion
 inline const float PARTICLE_BULK_MODULUS = 2000.0f;     
-inline const float PARTICLE_VISCOSITY = 0.1f;           
+inline const float PARTICLE_VISCOSITY = 0.5f;           
 inline const float PARTICLE_GRAVITY = 10.0f;           
 inline const float PARTICLE_MASS = 1.0f;                // normalised mass; pressure formula handles scaling
-inline const float PARTICLE_REPULSION = PARTICLE_BULK_MODULUS;
+inline const float PARTICLE_REPULSION = 0.5*PARTICLE_BULK_MODULUS;
 // until i learn how to write code :(
 inline const float PARTICLE_MAX_V = 7.5f;
 inline const float PARTICLE_RESTITUTION = 1.0f;
-inline const int PARTICLE_GHOST_DENSITY = 8;
+inline const int PARTICLE_GHOST_DENSITY = 4;
 
 // am I even using these?
 inline const int PARTICLE_N_FRAMES = 0; // Number of frames
 inline const int PARTICLE_NP_FRAMES = 0; // Steps per frame
 
 // coeffs
-inline const float PARTICLE_VISCOSITY_K_COEFF = 10.0f/std::numbers::pi_v<float> * 1.00000; 
+inline const float PARTICLE_VISCOSITY_K_COEFF = 25.0f/std::numbers::pi_v<float> * 1.00000; 
 inline const float PARTICLE_SPIKY_K = -45.0f / (std::numbers::pi_v<float> * std::pow(PARTICLE_SIZE, 6)); 
 
 inline constexpr size_t DESIRED_FLOATERS = 5000;
