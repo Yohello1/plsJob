@@ -17,27 +17,33 @@ DENSITY_NORM = 50.0 # Maps 0.02 max to 1.0
 VELOCITY_NORM = 1.0 / 7.5 # Maps 7.5 max to 1.0
 
 class SPHDataset(Dataset):
-    def __init__(self, data_dir):
-        self.data_dir = data_dir
-        self.frame_indices = []
-        d_files = glob.glob(os.path.join(data_dir, "*_d.bin"))
-        for f in d_files:
-            try:
-                idx = int(os.path.basename(f).split('_')[0])
-                self.frame_indices.append(idx)
-            except (ValueError, IndexError):
-                continue
-        self.frame_indices.sort()
+    def __init__(self, data_dirs):
+        if isinstance(data_dirs, str):
+            data_dirs = [data_dirs]
+        self.data_dirs = data_dirs
         self.samples = []
-        for i in range(len(self.frame_indices) - 1):
-            if self.frame_indices[i+1] == self.frame_indices[i] + 1:
-                self.samples.append((self.frame_indices[i], self.frame_indices[i+1]))
+        
+        for d_dir in self.data_dirs:
+            frame_indices = []
+            d_files = glob.glob(os.path.join(d_dir, "*_d.bin"))
+            for f in d_files:
+                try:
+                    idx = int(os.path.basename(f).split('_')[0])
+                    frame_indices.append(idx)
+                except (ValueError, IndexError):
+                    continue
+            frame_indices.sort()
+            
+            for i in range(len(frame_indices) - 1):
+                if frame_indices[i+1] == frame_indices[i] + 1:
+                    # Store (directory, prev_idx, curr_idx)
+                    self.samples.append((d_dir, frame_indices[i], frame_indices[i+1]))
 
     def __len__(self):
         return len(self.samples)
 
-    def load_bin(self, frame_idx, suffix, dtype=np.float32):
-        path = os.path.join(self.data_dir, f"{frame_idx}_{suffix}.bin")
+    def load_bin(self, data_dir, frame_idx, suffix, dtype=np.float32):
+        path = os.path.join(data_dir, f"{frame_idx}_{suffix}.bin")
         data = np.fromfile(path, dtype=dtype)
         data = data.reshape((BUFFER_HEIGHT, BUFFER_WIDTH))
         tensor = torch.tensor(data, dtype=torch.float32).unsqueeze(0)
@@ -50,11 +56,11 @@ class SPHDataset(Dataset):
         return tensor
 
     def __getitem__(self, idx):
-        prev_idx, curr_idx = self.samples[idx]
-        prev_d = self.load_bin(prev_idx, "d")
-        prev_vx = self.load_bin(prev_idx, "v_x")
-        prev_vy = self.load_bin(prev_idx, "v_y")
-        curr_d = self.load_bin(curr_idx, "d")
+        data_dir, prev_idx, curr_idx = self.samples[idx]
+        prev_d = self.load_bin(data_dir, prev_idx, "d")
+        prev_vx = self.load_bin(data_dir, prev_idx, "v_x")
+        prev_vy = self.load_bin(data_dir, prev_idx, "v_y")
+        curr_d = self.load_bin(data_dir, curr_idx, "d")
         return prev_d, torch.cat([prev_vx, prev_vy], dim=0), curr_d
 
 class Encoder(nn.Module):
@@ -125,7 +131,7 @@ def train(requested_epochs=None):
         print("No simulation data found.")
         return
 
-    dataset = SPHDataset(session_dirs[0]) # Simplified; in practice you'd combine sessions
+    dataset = SPHDataset(session_dirs)
     # Multi-session data loading logic could be added here
     
     # Scale batch size
@@ -141,9 +147,19 @@ def train(requested_epochs=None):
     criterion = nn.MSELoss()
     scaler = torch.amp.GradScaler('cuda')
 
+    # Prepare loss logging
+    log_file = "losses.csv"
+    if not os.path.exists(log_file):
+        with open(log_file, "w") as f:
+            f.write("epoch,loss,zero_loss,var\n")
+
     epochs = requested_epochs if requested_epochs else 50
     for epoch in range(epochs):
         model.train()
+        total_zero_loss = 0
+        total_ident_loss = 0
+        total_pred_var = 0
+        total_gt_var = 0
         for p_d, p_v, c_d in dataloader:
             p_d, p_v, c_d = p_d.to(device), p_v.to(device), c_d.to(device)
             optimizer.zero_grad(set_to_none=True)
@@ -151,13 +167,33 @@ def train(requested_epochs=None):
             with torch.amp.autocast('cuda'):
                 output = model(p_d, p_v, c_d)
                 loss = criterion(output, c_d)
+                # Baseline 1: Loss if we predict only 0 (density fields are mostly empty)
+                zero_loss = criterion(torch.zeros_like(c_d), c_d).item()
+                # Baseline 2: Loss if we predict no change (previous density)
+                ident_loss = criterion(p_d, c_d).item()
+                
+                total_zero_loss += zero_loss
+                total_ident_loss += ident_loss
+                total_pred_var += torch.var(output).item()
+                total_gt_var += torch.var(c_d).item()
             
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
         
         # Reports normalized MSE
-        print(f"Epoch {epoch+1}/{epochs}, Normalized Loss: {loss.item():.8f}")
+        current_loss = loss.item()
+        avg_zero_loss = total_zero_loss / len(dataloader)
+        avg_ident_loss = total_ident_loss / len(dataloader)
+        avg_pred_var = total_pred_var / len(dataloader)
+        avg_gt_var = total_gt_var / len(dataloader)
+        print(f"Epoch {epoch+1}/{epochs}, Loss: {current_loss:.8f}, Baseline (Zero): {avg_zero_loss:.8f}, Baseline (Ident): {avg_ident_loss:.8f}")
+        print(f"    - Var: [Pred: {avg_pred_var:.8f}, GT: {avg_gt_var:.8f}] | Max: [Pred: {output.max().item():.4f}, GT: {c_d.max().item():.4f}]")
+        
+        # Log to CSV
+        with open(log_file, "a") as f:
+            f.write(f"{epoch+1},{current_loss:.8f},{avg_zero_loss:.8f},{avg_ident_loss:.8f},{avg_pred_var:.8f},{avg_gt_var:.8f}\n")
+            
         torch.save(model.state_dict(), "best_model.pth")
 
 if __name__ == "__main__":

@@ -3,9 +3,9 @@
 
 # Configuration
 ITERATIONS=20         # Total cycles of (Simulate + Train)
-RUNS_PER_ITERATION=2  # How many simulations to start per cycle
+RUNS_PER_ITERATION=5  # How many simulations to start per cycle
 MAX_SESSIONS=5        # Keep only the last 5 simulation folders (to save space)
-EPOCHS_PER_CLEAN=10   # Number of training epochs per cycle
+EPOCHS_PER_CLEAN=5   # Number of training epochs per cycle
 FRAMES_PER_RUN=500    # Number of frames per simulation run
 
 # Ensure directories exist

@@ -7,9 +7,9 @@ if [ -n "$SLURM_ARRAY_TASK_ID" ]; then
 fi
 
 # Resolution Boundaries (400x400)
-MIN_X=40
-MAX_X=360
-MIN_Y=40
+MIN_X=50
+MAX_X=350
+MIN_Y=50
 MAX_Y=370
 
 # Scenario Choice
@@ -107,4 +107,4 @@ done
 # Run Simulation
 FRAME_COUNT=${1:-10000}
 echo "Executing: ./draw2 $FRAME_COUNT --headless $FLUID_ARGS $GHOST_ARGS"
-./draw2 $FRAME_COUNT $FLUID_ARGS $GHOST_ARGS
+../draw2 $FRAME_COUNT $FLUID_ARGS $GHOST_ARGS
