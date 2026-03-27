@@ -11,6 +11,9 @@ FRAMES_PER_RUN=500    # Number of frames per simulation run
 # Ensure directories exist
 mkdir -p data
 
+echo "BUILDING FLUID SIM";
+cd .. && make -j && cd scripts
+
 echo "Starting Active Learning Loop..."
 echo "Storage Limit: Last $MAX_SESSIONS simulation sessions will be preserved."
 
