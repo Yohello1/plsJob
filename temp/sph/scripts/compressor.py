@@ -16,7 +16,7 @@ BUFFER_HEIGHT = 400
 # Normalization factors
 DENSITY_NORM = 50.0 # Maps 0.02 max to 1.0
 VELOCITY_NORM = 1.0 / 7.5 # Maps 7.5 max to 1.0
-
+LATENT_DIM = 1024
 # Activation Configuration
 ACTIVATION_TYPE = "SiLU"
 ACTIVATION_LOOKUP = {
@@ -26,6 +26,20 @@ ACTIVATION_LOOKUP = {
     "ELU": nn.ELU
 }
 ACT = ACTIVATION_LOOKUP[ACTIVATION_TYPE]
+
+class ResBlock(nn.Module):
+    """Residual block to help deeper networks learn more effectively."""
+    def __init__(self, c):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(c, c, 3, padding=1),
+            nn.BatchNorm2d(c),
+            ACT(),
+            nn.Conv2d(c, c, 3, padding=1),
+            nn.BatchNorm2d(c)
+        )
+    def forward(self, x):
+        return ACT()(x + self.conv(x))
 
 class SPHDataset(Dataset):
     def __init__(self, data_dirs, skip=10):
@@ -76,90 +90,58 @@ class SPHDataset(Dataset):
         return prev_d, torch.cat([prev_vx, prev_vy], dim=0), curr_d
 
 class Encoder(nn.Module):
-    def __init__(self, latent_dim=512):
+    def __init__(self, latent_dim=1024):
         super().__init__()
-        # 400 -> 200 -> 100 -> 50 -> 25
+        # 400 -> 200 -> 100 -> 50
         self.conv = nn.Sequential(
             nn.Conv2d(4, 64, 3, stride=2, padding=1),   # 200
-            nn.BatchNorm2d(64), ACT(),
-            nn.Conv2d(64, 64, 3, stride=1, padding=1),
-            nn.BatchNorm2d(64), ACT(),
-            
+            ResBlock(64),
             nn.Conv2d(64, 128, 3, stride=2, padding=1), # 100
-            nn.BatchNorm2d(128), ACT(),
-            nn.Conv2d(128, 128, 3, stride=1, padding=1),
-            nn.BatchNorm2d(128), ACT(),
-            
-            nn.Conv2d(128, 256, 3, stride=2, padding=1),# 50
-            nn.BatchNorm2d(256), ACT(),
-            nn.Conv2d(256, 256, 3, stride=1, padding=1),
-            nn.BatchNorm2d(256), ACT(),
-            
-            nn.Conv2d(256, 512, 3, stride=2, padding=1),# 25
-            nn.BatchNorm2d(512), ACT(),
-            nn.Conv2d(512, 512, 3, stride=1, padding=1),
-            nn.BatchNorm2d(512), ACT(),
-            
+            ResBlock(128),
+            nn.Conv2d(128, 128, 3, stride=2, padding=1),# 50
+            ResBlock(128),
             nn.Flatten()
         )
-        self.fc = nn.Linear(512 * 25 * 25, latent_dim)
+        self.fc = nn.Linear(128 * 50 * 50, latent_dim)
 
     def forward(self, x):
         return self.fc(self.conv(x))
 
 class Decoder(nn.Module):
-    def __init__(self, latent_dim=512):
+    def __init__(self, latent_dim=1024):
         super().__init__()
-        self.fc = nn.Linear(latent_dim, 512 * 25 * 25)
+        self.fc = nn.Linear(latent_dim, 128 * 50 * 50)
+        
+        # Downsamples prev_d to 50x50 bottleneck
         self.prev_d_path = nn.Sequential(
-            nn.Conv2d(1, 64, 3, stride=2, padding=1), # 200
+            nn.Conv2d(1, 64, 3, stride=2, padding=1),   # 200
             ACT(),
-            nn.Conv2d(64, 64, 3, stride=1, padding=1),
-            ACT(),
-            
             nn.Conv2d(64, 128, 3, stride=2, padding=1), # 100
             ACT(),
-            nn.Conv2d(128, 128, 3, stride=1, padding=1),
-            ACT(),
-            
-            nn.Conv2d(128, 256, 3, stride=2, padding=1), # 50
-            ACT(),
-            nn.Conv2d(256, 256, 3, stride=1, padding=1),
-            ACT(),
-            
-            nn.Conv2d(256, 512, 3, stride=2, padding=1), # 25
-            ACT(),
-            nn.Conv2d(512, 512, 3, stride=1, padding=1),
+            nn.Conv2d(128, 128, 3, stride=2, padding=1),# 50
             ACT(),
         )
+        
+        # Upsamples from 50x50 back to 400x400
         self.deconv = nn.Sequential(
-            nn.Conv2d(1024, 1024, 3, stride=1, padding=1),
-            ACT(),
-            nn.ConvTranspose2d(1024, 512, 4, stride=2, padding=1), # 50
-            ACT(),
-            nn.Conv2d(512, 512, 3, stride=1, padding=1),
-            ACT(),
-            
-            nn.ConvTranspose2d(512, 256, 4, stride=2, padding=1),  # 100
-            ACT(),
-            nn.Conv2d(256, 256, 3, stride=1, padding=1),
-            ACT(),
-            
-            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1),  # 200
-            ACT(),
-            nn.Conv2d(128, 128, 3, stride=1, padding=1),
-            ACT(),
-            
-            nn.ConvTranspose2d(128, 1, 4, stride=2, padding=1),     # 400
+            nn.Upsample(size=(100,100), mode='bilinear', align_corners=False),
+            nn.Conv2d(256, 128, 3, padding=1), 
+            ResBlock(128),
+            nn.Upsample(size=(200,200), mode='bilinear', align_corners=False),
+            nn.Conv2d(128, 64, 3, padding=1),
+            ResBlock(64),
+            nn.Upsample(size=(400,400), mode='bilinear', align_corners=False),
+            nn.Conv2d(64, 1, 3, padding=1),
+            nn.Softplus() # Ensures density is always positive
         )
 
     def forward(self, z, prev_d):
-        z_feat = self.fc(z).view(-1, 512, 25, 25)
+        z_feat = self.fc(z).view(-1, 128, 50, 50)
         d_feat = self.prev_d_path(prev_d)
         return self.deconv(torch.cat([z_feat, d_feat], dim=1))
 
 class FullModel(nn.Module):
-    def __init__(self, latent_dim=512):
+    def __init__(self, latent_dim=1024):
         super().__init__()
         self.encoder = Encoder(latent_dim)
         self.decoder = Decoder(latent_dim)
@@ -186,8 +168,8 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         return
 
     # 1. Configuration & Constants
-    LR = 2e-5
-    LATENT_DIM = 512
+    LR = 1e-4
+    LATENT_DIM_LOCAL = LATENT_DIM
     # The dataset default skip is 10, but we can access it from dataset if needed
     
     # 2. Setup Run Directory (unique suffix inside output_dir)
@@ -215,7 +197,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     skip_val = train_dataset.skip
 
     # Initialize model early to get depth for logging
-    model = FullModel(LATENT_DIM).to(device)
+    model = FullModel(LATENT_DIM_LOCAL).to(device)
     model_depth = model.get_depth()
     print(f"Model Depth: {model_depth} convolutional layers.")
     
@@ -223,9 +205,11 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     epochs = requested_epochs if requested_epochs else 10
     with open(os.path.join(run_dir, "settings.txt"), "w") as f:
         f.write(f"Attempt: {run_idx}\n")
-        f.write(f"Learning Rate: {LR}\n")
+        f.write(f"Learning Rate: {LR} (Scheduled)\n")
         f.write(f"Activation: {ACTIVATION_TYPE}\n")
-        f.write(f"Latent Dim: {LATENT_DIM}\n")
+        f.write(f"Latent Dim: {LATENT_DIM_LOCAL}\n")
+        f.write(f"Grid Res: 400x400\n")
+        f.write(f"Bottleneck: 50x50\n")
         f.write(f"Skip Frames: {skip_val}\n")
         f.write(f"Epochs per Cycle: {epochs}\n")
         f.write(f"Train/Val Split: {len(train_dirs)}/{len(val_dirs)}\n")
@@ -242,6 +226,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         model = nn.DataParallel(model)
         
     optimizer = optim.Adam(model.parameters(), lr=LR)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
     criterion = nn.MSELoss()
     scaler = torch.amp.GradScaler('cuda')
 
@@ -296,6 +281,9 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         avg_train_var = total_train_var / len(train_loader)
         avg_val_var = total_val_var / len(val_loader)
         avg_val_gt_var = total_val_gt_var / len(val_loader)
+        
+        # Step the scheduler
+        scheduler.step(avg_val_loss)
         
         print(f"Epoch {epoch+1}/{epochs}")
         print(f"    Train Loss: {avg_train_loss:.8f} | Val Loss: {avg_val_loss:.8f}")
