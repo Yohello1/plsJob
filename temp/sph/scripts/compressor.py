@@ -82,12 +82,24 @@ class Encoder(nn.Module):
         self.conv = nn.Sequential(
             nn.Conv2d(4, 64, 3, stride=2, padding=1),   # 200
             nn.BatchNorm2d(64), ACT(),
+            nn.Conv2d(64, 64, 3, stride=1, padding=1),
+            nn.BatchNorm2d(64), ACT(),
+            
             nn.Conv2d(64, 128, 3, stride=2, padding=1), # 100
             nn.BatchNorm2d(128), ACT(),
+            nn.Conv2d(128, 128, 3, stride=1, padding=1),
+            nn.BatchNorm2d(128), ACT(),
+            
             nn.Conv2d(128, 256, 3, stride=2, padding=1),# 50
             nn.BatchNorm2d(256), ACT(),
+            nn.Conv2d(256, 256, 3, stride=1, padding=1),
+            nn.BatchNorm2d(256), ACT(),
+            
             nn.Conv2d(256, 512, 3, stride=2, padding=1),# 25
             nn.BatchNorm2d(512), ACT(),
+            nn.Conv2d(512, 512, 3, stride=1, padding=1),
+            nn.BatchNorm2d(512), ACT(),
+            
             nn.Flatten()
         )
         self.fc = nn.Linear(512 * 25 * 25, latent_dim)
@@ -102,20 +114,42 @@ class Decoder(nn.Module):
         self.prev_d_path = nn.Sequential(
             nn.Conv2d(1, 64, 3, stride=2, padding=1), # 200
             ACT(),
+            nn.Conv2d(64, 64, 3, stride=1, padding=1),
+            ACT(),
+            
             nn.Conv2d(64, 128, 3, stride=2, padding=1), # 100
             ACT(),
+            nn.Conv2d(128, 128, 3, stride=1, padding=1),
+            ACT(),
+            
             nn.Conv2d(128, 256, 3, stride=2, padding=1), # 50
             ACT(),
+            nn.Conv2d(256, 256, 3, stride=1, padding=1),
+            ACT(),
+            
             nn.Conv2d(256, 512, 3, stride=2, padding=1), # 25
+            ACT(),
+            nn.Conv2d(512, 512, 3, stride=1, padding=1),
             ACT(),
         )
         self.deconv = nn.Sequential(
+            nn.Conv2d(1024, 1024, 3, stride=1, padding=1),
+            ACT(),
             nn.ConvTranspose2d(1024, 512, 4, stride=2, padding=1), # 50
             ACT(),
+            nn.Conv2d(512, 512, 3, stride=1, padding=1),
+            ACT(),
+            
             nn.ConvTranspose2d(512, 256, 4, stride=2, padding=1),  # 100
             ACT(),
+            nn.Conv2d(256, 256, 3, stride=1, padding=1),
+            ACT(),
+            
             nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1),  # 200
             ACT(),
+            nn.Conv2d(128, 128, 3, stride=1, padding=1),
+            ACT(),
+            
             nn.ConvTranspose2d(128, 1, 4, stride=2, padding=1),     # 400
         )
 
@@ -132,6 +166,13 @@ class FullModel(nn.Module):
     def forward(self, p_d, p_v, c_d):
         z = self.encoder(torch.cat([p_d, p_v, c_d], dim=1))
         return self.decoder(z, p_d)
+
+    def get_depth(self):
+        count = 0
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+                count += 1
+        return count
 
 def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_filename="best_model.pth"):
     num_gpus = torch.cuda.device_count()
@@ -172,6 +213,11 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     train_dataset = SPHDataset(train_dirs)
     val_dataset = SPHDataset(val_dirs)
     skip_val = train_dataset.skip
+
+    # Initialize model early to get depth for logging
+    model = FullModel(LATENT_DIM).to(device)
+    model_depth = model.get_depth()
+    print(f"Model Depth: {model_depth} convolutional layers.")
     
     # 4. Save Settings
     epochs = requested_epochs if requested_epochs else 10
@@ -185,13 +231,13 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         f.write(f"Train/Val Split: {len(train_dirs)}/{len(val_dirs)}\n")
         f.write(f"Loss Function: MSELoss\n")
         f.write(f"Normalizations: Density={DENSITY_NORM}, Velocity={VELOCITY_NORM}\n")
+        f.write(f"Model Depth (Conv Layers): {model_depth}\n")
 
     # 5. Data Pipelines
     total_batch = max(1, 8 * num_gpus)
     train_loader = DataLoader(train_dataset, batch_size=total_batch, shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=total_batch, shuffle=False, num_workers=4, pin_memory=True)
     
-    model = FullModel(LATENT_DIM).to(device)
     if num_gpus > 1:
         model = nn.DataParallel(model)
         
