@@ -250,7 +250,17 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         
     optimizer = optim.Adam(model.parameters(), lr=LR)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
-    criterion = nn.MSELoss()
+    def weighted_mse_loss(input, target, fluid_weight=50.0):
+        # Base weight is 1.0 (empty space)
+        weights = torch.ones_like(target)
+        # Boost pixels that contain actual fluid (using a small threshold for noise)
+        weights[target > 0.05] = fluid_weight
+        
+        # Calculate weighted square error
+        # .mean() remains normalized so LR stays predictable
+        return torch.mean(weights * (input - target) ** 2)
+
+    criterion = weighted_mse_loss
     scaler = torch.amp.GradScaler('cuda')
 
     # Prepare loss logging
