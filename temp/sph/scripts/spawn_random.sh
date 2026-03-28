@@ -107,5 +107,5 @@ done
 # Run Simulation
 FRAME_COUNT=${1:-10000}
 echo "Executing: ./draw2 $FRAME_COUNT --headless $FLUID_ARGS $GHOST_ARGS"
-../draw2 $FRAME_COUNT --headless $FLUID_ARGS $GHOST_ARGS
+../draw2 $FRAME_COUNT $FLUID_ARGS $GHOST_ARGS
 

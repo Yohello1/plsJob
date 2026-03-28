@@ -14,7 +14,7 @@ module load cuda/12.4
 source env/bin/activate
 # --- Configuration ---
 ITERATIONS=20         # Total cycles
-RUNS_PER_ITERATION=10 # Parallel simulations per cycle
+RUNS_PER_ITERATION=2 # Parallel simulations per cycle
 MAX_SESSIONS=30       # Keep last N folders per run
 EPOCHS_PER_CLEAN=5    # Training epochs per cycle
 FRAMES_PER_RUN=200    # Frames per simulation

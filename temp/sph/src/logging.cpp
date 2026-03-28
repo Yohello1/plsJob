@@ -14,6 +14,7 @@
 
 namespace JD::logging
 {
+    static std::ofstream _log_file;
     static std::string _logging_dir;
 
     static std::string _get_log_dirname() {
@@ -47,10 +48,14 @@ namespace JD::logging
         {
             std::filesystem::create_directories(_logging_dir);
         }
+
+        _log_file.open(_logging_dir + "/sim_data.bin", std::ios::binary);
     }
     
     void log(size_t i)
     {
+        if (!_log_file.is_open()) return;
+
         // Grid size NxN
         const int N_W = BUFFER_WIDTH;
         const int N_H = BUFFER_HEIGHT;
@@ -82,36 +87,27 @@ namespace JD::logging
             }
         }
 
-        auto write_bin = [&](const std::string& suffix, auto get_val) {
-            std::string path = _logging_dir + "/" + std::to_string(i) + "_" + suffix + ".bin";
-            std::ofstream ofs(path, std::ios::binary);
-            if (!ofs.is_open()) return;
-
+        auto write_chunk = [&](auto get_val) {
             for (int j = 0; j < N_H * N_W; ++j) {
-                auto val = get_val(j);
-                ofs.write(reinterpret_cast<const char*>(&val), sizeof(val));
+                float val = static_cast<float>(get_val(j));
+                _log_file.write(reinterpret_cast<const char*>(&val), sizeof(float));
             }
         };
 
-        // Density
-        write_bin("d", [&](int idx) {
-            return count[idx] > 0 ? sum_d[idx] / count[idx] : 0.0f;
-        });
+        // Order: Density, V_x, V_y, Mask
+        write_chunk([&](int idx) { return count[idx] > 0 ? sum_d[idx] / count[idx] : 0.0f; });
+        write_chunk([&](int idx) { return count[idx] > 0 ? sum_vx[idx] / count[idx] : 0.0f; });
+        write_chunk([&](int idx) { return count[idx] > 0 ? sum_vy[idx] / count[idx] : 0.0f; });
+        write_chunk([&](int idx) { return static_cast<float>(mask[idx]); });
 
-        // V_x
-        write_bin("v_x", [&](int idx) {
-            return count[idx] > 0 ? sum_vx[idx] / count[idx] : 0.0f;
-        });
+        _log_file.flush();
+    }
 
-        // V_y
-        write_bin("v_y", [&](int idx) {
-            return count[idx] > 0 ? sum_vy[idx] / count[idx] : 0.0f;
-        });
-
-        // Mask
-        write_bin("m", [&](int idx) {
-            return (int)mask[idx];
-        });
+    void finish()
+    {
+        if (_log_file.is_open())
+        {
+            _log_file.close();
+        }
     }
 }
-

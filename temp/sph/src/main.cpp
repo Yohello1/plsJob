@@ -232,5 +232,6 @@ int main(int argc, char** argv) {
     }
 #endif
 
+     JD::logging::finish();
      return 0;
 }

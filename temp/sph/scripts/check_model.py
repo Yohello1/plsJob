@@ -36,9 +36,9 @@ def sanity_check():
 
     model.eval()
     with torch.no_grad():
-        p_d, p_v, c_d = next(iter(dataloader))
-        p_d, p_v, c_d = p_d.to(device), p_v.to(device), c_d.to(device)
-        output = model(p_d, p_v, c_d)
+        p_d, p_v, c_d, c_v, mask = next(iter(dataloader))
+        p_d, p_v, c_d, c_v, mask = p_d.to(device), p_v.to(device), c_d.to(device), c_v.to(device), mask.to(device)
+        output = model(p_d, p_v, c_d, c_v, mask)
         
         mse = torch.mean((output - c_d)**2).item()
         zero_mse = torch.mean(c_d**2).item()

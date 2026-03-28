@@ -49,28 +49,36 @@ class SPHDataset(Dataset):
         self.samples = []
         self.skip = skip
         
+        self.frame_size = 4 * BUFFER_WIDTH * BUFFER_HEIGHT * 4 # 4 fields * N * 4 bytes
+        self.field_size = BUFFER_WIDTH * BUFFER_HEIGHT * 4
+        self.order = {"d": 0, "v_x": 1, "v_y": 2, "m": 3}
+
         for d_dir in self.data_dirs:
-            frame_indices = []
-            d_files = glob.glob(os.path.join(d_dir, "*_d.bin"))
-            for f in d_files:
-                try:
-                    idx = int(os.path.basename(f).split('_')[0])
-                    frame_indices.append(idx)
-                except (ValueError, IndexError):
-                    continue
-            frame_indices.sort()
+            bin_file = os.path.join(d_dir, "sim_data.bin")
+            if not os.path.exists(bin_file):
+                continue
             
-            for i in range(len(frame_indices) - self.skip):
-                if frame_indices[i+self.skip] == frame_indices[i] + self.skip:
-                    # Store (directory, prev_idx, curr_idx)
-                    self.samples.append((d_dir, frame_indices[i], frame_indices[i+self.skip]))
+            file_size = os.path.getsize(bin_file)
+            num_frames = file_size // self.frame_size
+            
+            for i in range(num_frames - self.skip):
+                # Store (directory, prev_idx, curr_idx)
+                self.samples.append((d_dir, i, i + self.skip))
 
     def __len__(self):
         return len(self.samples)
 
     def load_bin(self, data_dir, frame_idx, suffix, dtype=np.float32):
-        path = os.path.join(data_dir, f"{frame_idx}_{suffix}.bin")
-        data = np.fromfile(path, dtype=dtype)
+        field_offset = self.order[suffix] * self.field_size
+        offset = frame_idx * self.frame_size + field_offset
+        
+        path = os.path.join(data_dir, "sim_data.bin")
+        # Optimization: keep files open or use memmap if needed, 
+        # but seek + fromfile is a good start for IOPS improvement
+        with open(path, "rb") as f:
+            f.seek(offset)
+            data = np.fromfile(f, dtype=dtype, count=BUFFER_WIDTH * BUFFER_HEIGHT)
+            
         data = data.reshape((BUFFER_HEIGHT, BUFFER_WIDTH))
         tensor = torch.tensor(data, dtype=torch.float32).unsqueeze(0)
         
@@ -83,22 +91,32 @@ class SPHDataset(Dataset):
 
     def __getitem__(self, idx):
         data_dir, prev_idx, curr_idx = self.samples[idx]
-        prev_d = self.load_bin(data_dir, prev_idx, "d")
-        prev_vx = self.load_bin(data_dir, prev_idx, "v_x")
-        prev_vy = self.load_bin(data_dir, prev_idx, "v_y")
-        curr_d = self.load_bin(data_dir, curr_idx, "d")
-        return prev_d, torch.cat([prev_vx, prev_vy], dim=0), curr_d
+        
+        # Load Previous Frame
+        p_d = self.load_bin(data_dir, prev_idx, "d")
+        p_v = torch.cat([self.load_bin(data_dir, prev_idx, "v_x"), 
+                       self.load_bin(data_dir, prev_idx, "v_y")], dim=0)
+        
+        # Load Current Frame
+        c_d = self.load_bin(data_dir, curr_idx, "d")
+        c_v = torch.cat([self.load_bin(data_dir, curr_idx, "v_x"), 
+                       self.load_bin(data_dir, curr_idx, "v_y")], dim=0)
+        
+        # Load Solid Mask
+        mask = self.load_bin(data_dir, prev_idx, "m")
+        
+        return p_d, p_v, c_d, c_v, mask
 
 class Encoder(nn.Module):
     def __init__(self, latent_dim=1024):
         super().__init__()
-        # 400 -> 200 -> 100 -> 50
+        # 400x7 -> 200x64 -> 100x128 -> 50x128
         self.conv = nn.Sequential(
-            nn.Conv2d(4, 64, 3, stride=2, padding=1),   # 200
+            nn.Conv2d(7, 64, 3, stride=2, padding=1),   # Input channels: p_d(1), p_v(2), c_d(1), c_v(2), mask(1)
             ResBlock(64),
-            nn.Conv2d(64, 128, 3, stride=2, padding=1), # 100
+            nn.Conv2d(64, 128, 3, stride=2, padding=1), 
             ResBlock(128),
-            nn.Conv2d(128, 128, 3, stride=2, padding=1),# 50
+            nn.Conv2d(128, 128, 3, stride=2, padding=1),
             ResBlock(128),
             nn.Flatten()
         )
@@ -132,21 +150,24 @@ class Decoder(nn.Module):
             ResBlock(64),
             nn.Upsample(size=(400,400), mode='bilinear', align_corners=False),
             nn.Conv2d(64, 1, 3, padding=1),
-            nn.Softplus() # Ensures density is always positive
+            # Final output will be added to prev_d, so no activation here
         )
+        self.final_act = nn.Softplus()
 
     def forward(self, z, prev_d):
         z_feat = self.fc(z).view(-1, 128, 50, 50)
         d_feat = self.prev_d_path(prev_d)
-        return self.deconv(torch.cat([z_feat, d_feat], dim=1))
+        delta = self.deconv(torch.cat([z_feat, d_feat], dim=1))
+        # Residual Connection: New Frame = Activation(Old Frame + Delta)
+        return self.final_act(prev_d + delta)
 
 class FullModel(nn.Module):
     def __init__(self, latent_dim=1024):
         super().__init__()
         self.encoder = Encoder(latent_dim)
         self.decoder = Decoder(latent_dim)
-    def forward(self, p_d, p_v, c_d):
-        z = self.encoder(torch.cat([p_d, p_v, c_d], dim=1))
+    def forward(self, p_d, p_v, c_d, c_v, mask):
+        z = self.encoder(torch.cat([p_d, p_v, c_d, c_v, mask], dim=1))
         return self.decoder(z, p_d)
 
     def get_depth(self):
@@ -241,12 +262,12 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         model.train()
         total_train_loss = 0
         total_train_var = 0
-        for p_d, p_v, c_d in train_loader:
-            p_d, p_v, c_d = p_d.to(device), p_v.to(device), c_d.to(device)
+        for p_d, p_v, c_d, c_v, mask in train_loader:
+            p_d, p_v, c_d, c_v, mask = p_d.to(device), p_v.to(device), c_d.to(device), c_v.to(device), mask.to(device)
             optimizer.zero_grad(set_to_none=True)
             
             with torch.amp.autocast('cuda'):
-                output = model(p_d, p_v, c_d)
+                output = model(p_d, p_v, c_d, c_v, mask)
                 loss = criterion(output, c_d)
                 total_train_loss += loss.item()
                 total_train_var += torch.var(output).item()
@@ -263,10 +284,10 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         total_val_var = 0
         total_val_gt_var = 0
         with torch.no_grad():
-            for p_d, p_v, c_d in val_loader:
-                p_d, p_v, c_d = p_d.to(device), p_v.to(device), c_d.to(device)
+            for p_d, p_v, c_d, c_v, mask in val_loader:
+                p_d, p_v, c_d, c_v, mask = p_d.to(device), p_v.to(device), c_d.to(device), c_v.to(device), mask.to(device)
                 with torch.amp.autocast('cuda'):
-                    output = model(p_d, p_v, c_d)
+                    output = model(p_d, p_v, c_d, c_v, mask)
                     total_val_loss += criterion(output, c_d).item()
                     total_val_zero += criterion(torch.zeros_like(c_d), c_d).item()
                     total_val_ident += criterion(p_d, c_d).item()
