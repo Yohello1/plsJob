@@ -6,6 +6,7 @@ import numpy as np
 import os
 import glob
 import sys
+import random
 
 # Constants based on SPH settings (Updated to 400x400)
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -122,14 +123,15 @@ class FullModel(nn.Module):
         z = self.encoder(torch.cat([p_d, p_v, c_d], dim=1))
         return self.decoder(z, p_d)
 
-def train(requested_epochs=None):
+def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_filename="best_model.pth"):
     num_gpus = torch.cuda.device_count()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Detected {num_gpus} GPU(s). Using device: {device}")
 
-    session_dirs = [os.path.join("data", d) for d in os.listdir("data") if os.path.isdir(os.path.join("data", d)) and d != "frames"] if os.path.exists("data") else []
+    # Use specified data_dir
+    session_dirs = [os.path.join(data_dir, d) for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d)) and d != "frames"] if os.path.exists(data_dir) else []
     if not session_dirs:
-        print("No simulation data found.")
+        print(f"No simulation data found in {data_dir}.")
         return
 
     # 1. Configuration & Constants
@@ -137,19 +139,29 @@ def train(requested_epochs=None):
     LATENT_DIM = 512
     # The dataset default skip is 10, but we can access it from dataset if needed
     
-    # 2. Setup Run Directory
-    run_base = "attempts"
-    os.makedirs(run_base, exist_ok=True)
+    # 2. Setup Run Directory (unique suffix inside output_dir)
+    os.makedirs(output_dir, exist_ok=True)
     run_idx = 1
-    while os.path.exists(os.path.join(run_base, f"run{run_idx}")):
+    while os.path.exists(os.path.join(output_dir, f"run{run_idx}")):
         run_idx += 1
-    run_dir = os.path.join(run_base, f"run{run_idx}")
+    run_dir = os.path.join(output_dir, f"run{run_idx}")
     os.makedirs(run_dir, exist_ok=True)
     print(f"Starting {run_dir}...")
 
-    # 3. Load Dataset
-    dataset = SPHDataset(session_dirs)
-    skip_val = dataset.skip
+    # 3. Split Dataset (90% Train, 10% Val)
+    random.seed(42)
+    random.shuffle(session_dirs)
+    split_idx = max(1, int(len(session_dirs) * 0.9))
+    if split_idx >= len(session_dirs) and len(session_dirs) > 1:
+        split_idx = len(session_dirs) - 1
+    
+    train_dirs = session_dirs[:split_idx]
+    val_dirs = session_dirs[split_idx:]
+    print(f"Dataset split: {len(train_dirs)} training sessions, {len(val_dirs)} validation sessions.")
+
+    train_dataset = SPHDataset(train_dirs)
+    val_dataset = SPHDataset(val_dirs)
+    skip_val = train_dataset.skip
     
     # 4. Save Settings
     epochs = requested_epochs if requested_epochs else 10
@@ -159,12 +171,14 @@ def train(requested_epochs=None):
         f.write(f"Latent Dim: {LATENT_DIM}\n")
         f.write(f"Skip Frames: {skip_val}\n")
         f.write(f"Epochs per Cycle: {epochs}\n")
+        f.write(f"Train/Val Split: {len(train_dirs)}/{len(val_dirs)}\n")
         f.write(f"Loss Function: MSELoss\n")
         f.write(f"Normalizations: Density={DENSITY_NORM}, Velocity={VELOCITY_NORM}\n")
 
-    # 5. Data Pipeline
+    # 5. Data Pipelines
     total_batch = max(1, 8 * num_gpus)
-    dataloader = DataLoader(dataset, batch_size=total_batch, shuffle=True, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=total_batch, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=total_batch, shuffle=False, num_workers=4, pin_memory=True)
     
     model = FullModel(LATENT_DIM).to(device)
     if num_gpus > 1:
@@ -177,56 +191,75 @@ def train(requested_epochs=None):
     # Prepare loss logging
     log_file = os.path.join(run_dir, "losses.csv")
     with open(log_file, "w") as f:
-        f.write("epoch,loss,zero_loss,ident_loss,pred_var,gt_var\n")
+        f.write("epoch,train_loss,val_loss,val_zero,val_ident,train_var,val_var\n")
 
     epochs = requested_epochs if requested_epochs else 50
     for epoch in range(epochs):
+        # --- TRAINING LOOP ---
         model.train()
-        total_zero_loss = 0
-        total_ident_loss = 0
-        total_pred_var = 0
-        total_gt_var = 0
-        for p_d, p_v, c_d in dataloader:
+        total_train_loss = 0
+        total_train_var = 0
+        for p_d, p_v, c_d in train_loader:
             p_d, p_v, c_d = p_d.to(device), p_v.to(device), c_d.to(device)
             optimizer.zero_grad(set_to_none=True)
             
             with torch.amp.autocast('cuda'):
                 output = model(p_d, p_v, c_d)
                 loss = criterion(output, c_d)
-                # Baseline 1: Loss if we predict only 0 (density fields are mostly empty)
-                zero_loss = criterion(torch.zeros_like(c_d), c_d).item()
-                # Baseline 2: Loss if we predict no change (previous density)
-                ident_loss = criterion(p_d, c_d).item()
-                
-                total_zero_loss += zero_loss
-                total_ident_loss += ident_loss
-                total_pred_var += torch.var(output).item()
-                total_gt_var += torch.var(c_d).item()
+                total_train_loss += loss.item()
+                total_train_var += torch.var(output).item()
             
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
         
+        # --- VALIDATION LOOP ---
+        model.eval()
+        total_val_loss = 0
+        total_val_zero = 0
+        total_val_ident = 0
+        total_val_var = 0
+        total_val_gt_var = 0
+        with torch.no_grad():
+            for p_d, p_v, c_d in val_loader:
+                p_d, p_v, c_d = p_d.to(device), p_v.to(device), c_d.to(device)
+                with torch.amp.autocast('cuda'):
+                    output = model(p_d, p_v, c_d)
+                    total_val_loss += criterion(output, c_d).item()
+                    total_val_zero += criterion(torch.zeros_like(c_d), c_d).item()
+                    total_val_ident += criterion(p_d, c_d).item()
+                    total_val_var += torch.var(output).item()
+                    total_val_gt_var += torch.var(c_d).item()
+
         # Reports normalized MSE
-        current_loss = loss.item()
-        avg_zero_loss = total_zero_loss / len(dataloader)
-        avg_ident_loss = total_ident_loss / len(dataloader)
-        avg_pred_var = total_pred_var / len(dataloader)
-        avg_gt_var = total_gt_var / len(dataloader)
-        print(f"Epoch {epoch+1}/{epochs}, Loss: {current_loss:.8f}, Baseline (Zero): {avg_zero_loss:.8f}, Baseline (Ident): {avg_ident_loss:.8f}")
-        print(f"    - Var: [Pred: {avg_pred_var:.8f}, GT: {avg_gt_var:.8f}] | Max: [Pred: {output.max().item():.4f}, GT: {c_d.max().item():.4f}]")
+        avg_train_loss = total_train_loss / len(train_loader)
+        avg_val_loss = total_val_loss / len(val_loader)
+        avg_val_zero = total_val_zero / len(val_loader)
+        avg_val_ident = total_val_ident / len(val_loader)
+        avg_train_var = total_train_var / len(train_loader)
+        avg_val_var = total_val_var / len(val_loader)
+        avg_val_gt_var = total_val_gt_var / len(val_loader)
+        
+        print(f"Epoch {epoch+1}/{epochs}")
+        print(f"    Train Loss: {avg_train_loss:.8f} | Val Loss: {avg_val_loss:.8f}")
+        print(f"    Val Baselines: [Zero: {avg_val_zero:.8f}, Ident: {avg_val_ident:.8f}]")
+        print(f"    Variance: [Train: {avg_train_var:.8f}, Val: {avg_val_var:.8f}, Val_GT: {avg_val_gt_var:.8f}]")
+        print(f"    Val Max: [Pred: {output.max().item():.4f}, GT: {c_d.max().item():.4f}]")
         
         # Log to CSV
         with open(log_file, "a") as f:
-            f.write(f"{epoch+1},{current_loss:.8f},{avg_zero_loss:.8f},{avg_ident_loss:.8f},{avg_pred_var:.8f},{avg_gt_var:.8f}\n")
+            f.write(f"{epoch+1},{avg_train_loss:.8f},{avg_val_loss:.8f},{avg_val_zero:.8f},{avg_val_ident:.8f},{avg_train_var:.8f},{avg_val_var:.8f}\n")
             
         torch.save(model.state_dict(), os.path.join(run_dir, "best_model.pth"))
-        # Also keep a copy in main dir for continuity
-        torch.save(model.state_dict(), "best_model.pth")
+        # Also keep a copy in output_dir (run-collection root) for current state
+        torch.save(model.state_dict(), os.path.join(output_dir, model_filename))
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--data_dir", type=str, default="data")
+    parser.add_argument("--output_dir", type=str, default="attempts")
+    parser.add_argument("--model_name", type=str, default="best_model.pth")
     args = parser.parse_args()
-    train(args.epochs)
+    train(args.epochs, args.data_dir, args.output_dir, args.model_name)
