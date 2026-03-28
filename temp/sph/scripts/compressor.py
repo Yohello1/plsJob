@@ -152,14 +152,16 @@ class Decoder(nn.Module):
             nn.Conv2d(64, 1, 3, padding=1),
             # Final output will be added to prev_d, so no activation here
         )
-        self.final_act = nn.Softplus()
+        self.final_act = nn.Sigmoid()
 
     def forward(self, z, prev_d):
         z_feat = self.fc(z).view(-1, 128, 50, 50)
         d_feat = self.prev_d_path(prev_d)
-        delta = self.deconv(torch.cat([z_feat, d_feat], dim=1))
-        # Residual Connection: New Frame = Activation(Old Frame + Delta)
-        return self.final_act(prev_d + delta)
+        
+        # Absolute Prediction: We still use prev_d as a feature input (d_feat),
+        # but we predict the entire next frame from scratch to avoid the 'Residual Annihilation' collapse.
+        raw_output = self.deconv(torch.cat([z_feat, d_feat], dim=1))
+        return self.final_act(raw_output)
 
 class FullModel(nn.Module):
     def __init__(self, latent_dim=1024):
