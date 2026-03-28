@@ -93,8 +93,14 @@ int main(int argc, char** argv) {
 
     JD::graphics::initGrid();
     JD::floaters::init(-1.0f, -1.0f, fluidBoxes, ghostBoxes);
-    std::filesystem::create_directories("data/frames");
+    
+    // Find where to put the data
+    const char* data_root = std::getenv("SPH_DATA_ROOT");
+    std::string base = (data_root && strlen(data_root) > 0) ? std::string(data_root) : "data";
+    std::filesystem::create_directories(base + "/frames");
+    
     JD::logging::init();
+
     
     // Robust seeding
     std::random_device rd;
@@ -209,11 +215,12 @@ int main(int argc, char** argv) {
         std::cout << "Frame " << (frame_num-1)
                   << " Time: " << std::fixed << std::setprecision(4) << time_taken << "s" << std::endl;
     
-        std::string frame_name = "data/frames/";
+        std::string frame_name = base + "/frames/";
         frame_name += std::to_string(frame_num);
         std::cout << "NAME:" <<  frame_name << '\n';
         frame_name += ".ppm";
         std::cout << "NAME:" << frame_name << '\n';
+
         // JD::graphics::outputPPM(BUFFER_HEIGHT, BUFFER_WIDTH, frame_name);
     }
 

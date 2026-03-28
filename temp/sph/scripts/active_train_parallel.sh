@@ -20,11 +20,15 @@ EPOCHS_PER_CLEAN=5    # Training epochs per cycle
 FRAMES_PER_RUN=200    # Frames per simulation
 
 # --- Unique Run Setup ---
+# Get the absolute path to the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
 # Use first argument as RUN_NAME if provided, otherwise generate a unique one
 RUN_NAME=${1:-run_$(date +%Y%m%d_%H%M%S)}
-DATA_DIR="data/$RUN_NAME"
-LOG_DIR="logs/$RUN_NAME"
-ATTEMPTS_DIR="attempts/$RUN_NAME"
+DATA_DIR="$SCRIPT_DIR/data/$RUN_NAME"
+LOG_DIR="$SCRIPT_DIR/logs/$RUN_NAME"
+ATTEMPTS_DIR="$SCRIPT_DIR/attempts/$RUN_NAME"
 
 echo "Setting up unique run: $RUN_NAME"
 mkdir -p "$DATA_DIR" "$LOG_DIR" "$ATTEMPTS_DIR"
@@ -33,13 +37,14 @@ mkdir -p "$DATA_DIR" "$LOG_DIR" "$ATTEMPTS_DIR"
 export SPH_DATA_ROOT="$DATA_DIR"
 
 echo "Checking fluid sim build...";
-cd ..
+cd "$ROOT_DIR"
 # Only build if binary is missing or if explicitly requested via BUILD=1
 if [ ! -f ./draw2 ] || [ "$BUILD" == "1" ]; then
     echo "Building (this might take a moment)..."
     make -j
 fi
-cd scripts
+cd "$SCRIPT_DIR"
+
 
 echo "Starting Parallel Active Learning Loop for $RUN_NAME..."
 
@@ -65,7 +70,7 @@ for i in $(seq 1 $ITERATIONS); do
 
     # 3. TRAIN ON REMAINING DATA
     echo "Starting training session..."
-    /home/yohello/code/plsJob/temp/sph/scripts/venv/bin/python compressor.py \
+    ./env/bin/python compressor.py \
         --epochs $EPOCHS_PER_CLEAN \
         --data_dir "$DATA_DIR" \
         --output_dir "$ATTEMPTS_DIR" \

@@ -4,42 +4,57 @@
 # Configuration
 ITERATIONS=20         # Total cycles of (Simulate + Train)
 RUNS_PER_ITERATION=5  # How many simulations to start per cycle
-MAX_SESSIONS=5        # Keep only the last 5 simulation folders (to save space)
+MAX_SESSIONS=5        # Keep only the last N simulation folders per run
 EPOCHS_PER_CLEAN=5   # Number of training epochs per cycle
 FRAMES_PER_RUN=500    # Number of frames per simulation run
 
-# Ensure directories exist
-mkdir -p data
+# --- Unique Run Setup ---
+# Use first argument as RUN_NAME if provided, otherwise generate a unique one
+RUN_NAME=${1:-run_$(date +%Y%m%d_%H%M%S)}
+DATA_DIR="data/$RUN_NAME"
+LOG_DIR="logs/$RUN_NAME"
+ATTEMPTS_DIR="attempts/$RUN_NAME"
 
-echo "BUILDING FLUID SIM";
-cd .. && make -j && cd scripts
+echo "Setting up unique run: $RUN_NAME"
+mkdir -p "$DATA_DIR" "$LOG_DIR" "$ATTEMPTS_DIR"
 
-echo "Starting Active Learning Loop..."
-echo "Storage Limit: Last $MAX_SESSIONS simulation sessions will be preserved."
+# Export for the simulation binary (src/logging.cpp)
+export SPH_DATA_ROOT="$DATA_DIR"
+
+echo "Checking fluid sim build...";
+cd ..
+if [ ! -f ./draw2 ] || [ "$BUILD" == "1" ]; then
+    echo "Building (this might take a moment)..."
+    make -j
+fi
+cd scripts
+
+echo "Starting Active Learning Loop for $RUN_NAME..."
 
 for i in $(seq 1 $ITERATIONS); do
     echo "========================================"
-    echo "   Cycle $i of $ITERATIONS"
+    echo "   Cycle $i of $ITERATIONS (Run: $RUN_NAME)"
     echo "========================================"
     
     # 1. GENERATE DATA
     for r in $(seq 1 $RUNS_PER_ITERATION); do
         echo "Running simulation $r of $RUNS_PER_ITERATION for $FRAMES_PER_RUN frames..."
-        ./spawn_random.sh $FRAMES_PER_RUN > /dev/null 2>&1
+        ./spawn_random.sh $FRAMES_PER_RUN > "$LOG_DIR/sim_c${i}_r${r}.log" 2>&1
     done
 
-    # 2. STORAGE CLEANUP (Rolling Buffer)
-    # This finds all subdirectories in data/ (excluding data/ itself and data/frames)
-    # Sorts them by modification time (newest first)
-    # Picks everything after the 5th and deletes them
-    echo "Cleaning up old simulation data (keeping top $MAX_SESSIONS)..."
-    ls -dt data/*/ | tail -n +$((MAX_SESSIONS + 1)) | xargs -r rm -rf
+    # 2. STORAGE CLEANUP (Rolling Buffer - Run Specific)
+    echo "Cleaning up old simulation data in $DATA_DIR (keeping top $MAX_SESSIONS)..."
+    ls -dt "$DATA_DIR"/*/ | tail -n +$((MAX_SESSIONS + 1)) | xargs -r rm -rf
 
-    # 3. TRAIN ON REMAINING DATA (all current sessions)
-    echo "Starting training session on all remaining data..."
-    python compressor.py --epochs $EPOCHS_PER_CLEAN
+    # 3. TRAIN ON REMAINING DATA
+    echo "Starting training session on all remaining data in $DATA_DIR..."
+    python compressor.py \
+        --epochs $EPOCHS_PER_CLEAN \
+        --data_dir "$DATA_DIR" \
+        --output_dir "$ATTEMPTS_DIR" \
+        --model_name "best_model.pth"
     
-    echo "Cycle $i complete. Best model checkpoint updated."
+    echo "Cycle $i complete. Best model checkpoint updated in $ATTEMPTS_DIR."
 done
 
-echo "Active Training Loop Finished."
+echo "Active Training Loop Finished for $RUN_NAME."

@@ -17,6 +17,16 @@ BUFFER_HEIGHT = 400
 DENSITY_NORM = 50.0 # Maps 0.02 max to 1.0
 VELOCITY_NORM = 1.0 / 7.5 # Maps 7.5 max to 1.0
 
+# Activation Configuration
+ACTIVATION_TYPE = "SiLU"
+ACTIVATION_LOOKUP = {
+    "ReLU": nn.ReLU,
+    "SiLU": nn.SiLU,
+    "LeakyReLU": lambda: nn.LeakyReLU(0.01),
+    "ELU": nn.ELU
+}
+ACT = ACTIVATION_LOOKUP[ACTIVATION_TYPE]
+
 class SPHDataset(Dataset):
     def __init__(self, data_dirs, skip=10):
         if isinstance(data_dirs, str):
@@ -71,13 +81,13 @@ class Encoder(nn.Module):
         # 400 -> 200 -> 100 -> 50 -> 25
         self.conv = nn.Sequential(
             nn.Conv2d(4, 64, 3, stride=2, padding=1),   # 200
-            nn.BatchNorm2d(64), nn.ReLU(),
+            nn.BatchNorm2d(64), ACT(),
             nn.Conv2d(64, 128, 3, stride=2, padding=1), # 100
-            nn.BatchNorm2d(128), nn.ReLU(),
+            nn.BatchNorm2d(128), ACT(),
             nn.Conv2d(128, 256, 3, stride=2, padding=1),# 50
-            nn.BatchNorm2d(256), nn.ReLU(),
+            nn.BatchNorm2d(256), ACT(),
             nn.Conv2d(256, 512, 3, stride=2, padding=1),# 25
-            nn.BatchNorm2d(512), nn.ReLU(),
+            nn.BatchNorm2d(512), ACT(),
             nn.Flatten()
         )
         self.fc = nn.Linear(512 * 25 * 25, latent_dim)
@@ -91,21 +101,21 @@ class Decoder(nn.Module):
         self.fc = nn.Linear(latent_dim, 512 * 25 * 25)
         self.prev_d_path = nn.Sequential(
             nn.Conv2d(1, 64, 3, stride=2, padding=1), # 200
-            nn.ReLU(),
+            ACT(),
             nn.Conv2d(64, 128, 3, stride=2, padding=1), # 100
-            nn.ReLU(),
+            ACT(),
             nn.Conv2d(128, 256, 3, stride=2, padding=1), # 50
-            nn.ReLU(),
+            ACT(),
             nn.Conv2d(256, 512, 3, stride=2, padding=1), # 25
-            nn.ReLU(),
+            ACT(),
         )
         self.deconv = nn.Sequential(
             nn.ConvTranspose2d(1024, 512, 4, stride=2, padding=1), # 50
-            nn.ReLU(),
+            ACT(),
             nn.ConvTranspose2d(512, 256, 4, stride=2, padding=1),  # 100
-            nn.ReLU(),
+            ACT(),
             nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1),  # 200
-            nn.ReLU(),
+            ACT(),
             nn.ConvTranspose2d(128, 1, 4, stride=2, padding=1),     # 400
         )
 
@@ -168,6 +178,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     with open(os.path.join(run_dir, "settings.txt"), "w") as f:
         f.write(f"Attempt: {run_idx}\n")
         f.write(f"Learning Rate: {LR}\n")
+        f.write(f"Activation: {ACTIVATION_TYPE}\n")
         f.write(f"Latent Dim: {LATENT_DIM}\n")
         f.write(f"Skip Frames: {skip_val}\n")
         f.write(f"Epochs per Cycle: {epochs}\n")
