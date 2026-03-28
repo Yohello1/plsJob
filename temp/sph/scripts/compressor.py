@@ -17,11 +17,12 @@ DENSITY_NORM = 50.0 # Maps 0.02 max to 1.0
 VELOCITY_NORM = 1.0 / 7.5 # Maps 7.5 max to 1.0
 
 class SPHDataset(Dataset):
-    def __init__(self, data_dirs):
+    def __init__(self, data_dirs, skip=10):
         if isinstance(data_dirs, str):
             data_dirs = [data_dirs]
         self.data_dirs = data_dirs
         self.samples = []
+        self.skip = skip
         
         for d_dir in self.data_dirs:
             frame_indices = []
@@ -34,10 +35,10 @@ class SPHDataset(Dataset):
                     continue
             frame_indices.sort()
             
-            for i in range(len(frame_indices) - 1):
-                if frame_indices[i+1] == frame_indices[i] + 1:
+            for i in range(len(frame_indices) - self.skip):
+                if frame_indices[i+self.skip] == frame_indices[i] + self.skip:
                     # Store (directory, prev_idx, curr_idx)
-                    self.samples.append((d_dir, frame_indices[i], frame_indices[i+1]))
+                    self.samples.append((d_dir, frame_indices[i], frame_indices[i+self.skip]))
 
     def __len__(self):
         return len(self.samples)
@@ -131,27 +132,52 @@ def train(requested_epochs=None):
         print("No simulation data found.")
         return
 
-    dataset = SPHDataset(session_dirs)
-    # Multi-session data loading logic could be added here
+    # 1. Configuration & Constants
+    LR = 2e-5
+    LATENT_DIM = 512
+    # The dataset default skip is 10, but we can access it from dataset if needed
     
-    # Scale batch size
-    batch_per_gpu = 8 # Reduced from 16 to save memory
-    total_batch = max(1, batch_per_gpu * num_gpus)
+    # 2. Setup Run Directory
+    run_base = "attempts"
+    os.makedirs(run_base, exist_ok=True)
+    run_idx = 1
+    while os.path.exists(os.path.join(run_base, f"run{run_idx}")):
+        run_idx += 1
+    run_dir = os.path.join(run_base, f"run{run_idx}")
+    os.makedirs(run_dir, exist_ok=True)
+    print(f"Starting {run_dir}...")
+
+    # 3. Load Dataset
+    dataset = SPHDataset(session_dirs)
+    skip_val = dataset.skip
+    
+    # 4. Save Settings
+    epochs = requested_epochs if requested_epochs else 10
+    with open(os.path.join(run_dir, "settings.txt"), "w") as f:
+        f.write(f"Attempt: {run_idx}\n")
+        f.write(f"Learning Rate: {LR}\n")
+        f.write(f"Latent Dim: {LATENT_DIM}\n")
+        f.write(f"Skip Frames: {skip_val}\n")
+        f.write(f"Epochs per Cycle: {epochs}\n")
+        f.write(f"Loss Function: MSELoss\n")
+        f.write(f"Normalizations: Density={DENSITY_NORM}, Velocity={VELOCITY_NORM}\n")
+
+    # 5. Data Pipeline
+    total_batch = max(1, 8 * num_gpus)
     dataloader = DataLoader(dataset, batch_size=total_batch, shuffle=True, num_workers=4, pin_memory=True)
     
-    model = FullModel().to(device)
+    model = FullModel(LATENT_DIM).to(device)
     if num_gpus > 1:
         model = nn.DataParallel(model)
         
-    optimizer = optim.Adam(model.parameters(), lr=2e-5)
+    optimizer = optim.Adam(model.parameters(), lr=LR)
     criterion = nn.MSELoss()
     scaler = torch.amp.GradScaler('cuda')
 
     # Prepare loss logging
-    log_file = "losses.csv"
-    if not os.path.exists(log_file):
-        with open(log_file, "w") as f:
-            f.write("epoch,loss,zero_loss,var\n")
+    log_file = os.path.join(run_dir, "losses.csv")
+    with open(log_file, "w") as f:
+        f.write("epoch,loss,zero_loss,ident_loss,pred_var,gt_var\n")
 
     epochs = requested_epochs if requested_epochs else 50
     for epoch in range(epochs):
@@ -194,6 +220,8 @@ def train(requested_epochs=None):
         with open(log_file, "a") as f:
             f.write(f"{epoch+1},{current_loss:.8f},{avg_zero_loss:.8f},{avg_ident_loss:.8f},{avg_pred_var:.8f},{avg_gt_var:.8f}\n")
             
+        torch.save(model.state_dict(), os.path.join(run_dir, "best_model.pth"))
+        # Also keep a copy in main dir for continuity
         torch.save(model.state_dict(), "best_model.pth")
 
 if __name__ == "__main__":
