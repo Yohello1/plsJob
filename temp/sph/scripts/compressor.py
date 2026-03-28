@@ -143,7 +143,7 @@ def train(requested_epochs=None):
     if num_gpus > 1:
         model = nn.DataParallel(model)
         
-    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    optimizer = optim.Adam(model.parameters(), lr=2e-5)
     criterion = nn.MSELoss()
     scaler = torch.amp.GradScaler('cuda')
 
