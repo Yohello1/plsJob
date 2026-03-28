@@ -10,6 +10,7 @@
 #include <vector>
 #include <filesystem>
 #include <cstdlib>
+#include <cstring>
 
 namespace JD::logging
 {
@@ -38,7 +39,10 @@ namespace JD::logging
 
     void init()
     {
-        _logging_dir = "data/" + _get_log_dirname();
+        const char* data_root = std::getenv("SPH_DATA_ROOT");
+        std::string base = (data_root && strlen(data_root) > 0) ? std::string(data_root) : "data";
+        
+        _logging_dir = base + "/" + _get_log_dirname();
         if (!std::filesystem::exists(_logging_dir)) 
         {
             std::filesystem::create_directories(_logging_dir);
