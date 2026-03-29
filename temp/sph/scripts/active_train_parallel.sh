@@ -14,21 +14,19 @@ module load cuda/12.4
 source env/bin/activate
 # --- Configuration ---
 ITERATIONS=20         # Total cycles
-RUNS_PER_ITERATION=2 # Parallel simulations per cycle
+RUNS_PER_ITERATION=10 # Parallel simulations per cycle
 MAX_SESSIONS=30       # Keep last N folders per run
 EPOCHS_PER_CLEAN=5    # Training epochs per cycle
 FRAMES_PER_RUN=200    # Frames per simulation
+MASS_LOSS_START_CYCLE=5
+MASS_LOSS_WEIGHT=2.0
 
 # --- Unique Run Setup ---
-# Get the absolute path to the directory where this script is located
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-
 # Use first argument as RUN_NAME if provided, otherwise generate a unique one
 RUN_NAME=${1:-run_$(date +%Y%m%d_%H%M%S)}
-DATA_DIR="$SCRIPT_DIR/data/$RUN_NAME"
-LOG_DIR="$SCRIPT_DIR/logs/$RUN_NAME"
-ATTEMPTS_DIR="$SCRIPT_DIR/attempts/$RUN_NAME"
+DATA_DIR="data/$RUN_NAME"
+LOG_DIR="logs/$RUN_NAME"
+ATTEMPTS_DIR="attempts/$RUN_NAME"
 
 echo "Setting up unique run: $RUN_NAME"
 mkdir -p "$DATA_DIR" "$LOG_DIR" "$ATTEMPTS_DIR"
@@ -37,14 +35,12 @@ mkdir -p "$DATA_DIR" "$LOG_DIR" "$ATTEMPTS_DIR"
 export SPH_DATA_ROOT="$DATA_DIR"
 
 echo "Checking fluid sim build...";
-cd "$ROOT_DIR"
+cd ..
 # Only build if binary is missing or if explicitly requested via BUILD=1
-if [ ! -f ./draw2 ] || [ "$BUILD" == "1" ]; then
-    echo "Building (this might take a moment)..."
-    make -j
-fi
-cd "$SCRIPT_DIR"
+make clean
+make -j
 
+cd scripts
 
 echo "Starting Parallel Active Learning Loop for $RUN_NAME..."
 
@@ -71,10 +67,16 @@ for i in $(seq 1 $ITERATIONS); do
     # 3. TRAIN ON REMAINING DATA
     echo "Starting training session..."
     ./env/bin/python compressor.py \
+        --cycle $i \
         --epochs $EPOCHS_PER_CLEAN \
         --data_dir "$DATA_DIR" \
         --output_dir "$ATTEMPTS_DIR" \
-        --model_name "best_model.pth"
+        --model_name "best_model.pth" \
+        --mass_loss_weight $MASS_LOSS_WEIGHT \
+        --mass_loss_start_cycle $MASS_LOSS_START_CYCLE \
+        --batch_size 1 \
+        --effective_batch_size 8 \
+        --bf16
     
     echo "Cycle $i complete."
 done

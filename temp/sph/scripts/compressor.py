@@ -7,6 +7,8 @@ import os
 import glob
 import sys
 import random
+import gc
+from torch.utils.checkpoint import checkpoint
 
 # Constants based on SPH settings (Updated to 400x400)
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -38,8 +40,13 @@ class ResBlock(nn.Module):
             nn.Conv2d(c, c, 3, padding=1),
             nn.BatchNorm2d(c)
         )
-    def forward(self, x):
+    def _inner_forward(self, x):
         return ACT()(x + self.conv(x))
+        
+    def forward(self, x):
+        if self.training:
+            return checkpoint(self._inner_forward, x, use_reentrant=False)
+        return self._inner_forward(x)
 
 class SPHDataset(Dataset):
     def __init__(self, data_dirs, skip=10):
@@ -179,7 +186,17 @@ class FullModel(nn.Module):
                 count += 1
         return count
 
-def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_filename="best_model.pth", fluid_weight=50.0):
+def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_filename="best_model.pth", fluid_weight=50.0, mass_loss_weight=0.0, args=None):
+    # Determine effective mass loss weight based on curriculum
+    current_cycle = args.cycle if args and hasattr(args, 'cycle') else 1
+    start_cycle = args.mass_loss_start_cycle if args and hasattr(args, 'mass_loss_start_cycle') else 1
+    
+    effective_mass_weight = mass_loss_weight if current_cycle >= start_cycle else 0.0
+    if effective_mass_weight != mass_loss_weight:
+        print(f"Curriculum: Mass loss weight delayed (current cycle {current_cycle} < start cycle {start_cycle}) | Effective Weight: {effective_mass_weight}")
+    else:
+        print(f"Curriculum: Mass loss weight active (Cycle {current_cycle} >= {start_cycle}) | Effective Weight: {effective_mass_weight}")
+
     num_gpus = torch.cuda.device_count()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Detected {num_gpus} GPU(s). Using device: {device}")
@@ -221,6 +238,19 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
 
     # Initialize model early to get depth for logging
     model = FullModel(LATENT_DIM_LOCAL).to(device)
+    
+    # Precision Control: BF16 saves ~2.4GB on weights/grads for this model
+    is_bf16 = args.bf16 if args and hasattr(args, 'bf16') else False
+    if is_bf16 and torch.cuda.is_bf16_supported():
+        model.to(torch.bfloat16)
+        # Keep normalization layers in float32 for stability and type compatibility
+        for m in model.modules():
+            if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d, nn.LayerNorm, nn.GroupNorm)):
+                m.float()
+        print("Enabled BFloat16 Precision (BatchNorm/Normalization kept in Float32)")
+    else:
+        is_bf16 = False
+    
     model_depth = model.get_depth()
     print(f"Model Depth: {model_depth} convolutional layers.")
     
@@ -238,30 +268,55 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         f.write(f"Train/Val Split: {len(train_dirs)}/{len(val_dirs)}\n")
         f.write(f"Loss Function: WeightedMSE (Fluid Weight: {fluid_weight})\n")
         f.write(f"Normalizations: Density={DENSITY_NORM}, Velocity={VELOCITY_NORM}\n")
+        f.write(f"Cycle: {current_cycle}\n")
+        f.write(f"Mass Loss Weight (Target): {mass_loss_weight}\n")
+        f.write(f"Mass Loss Start Cycle: {start_cycle}\n")
+        f.write(f"Effective Mass Loss Weight: {effective_mass_weight}\n")
         f.write(f"Model Depth (Conv Layers): {model_depth}\n")
 
     # 5. Data Pipelines
-    total_batch = max(1, 8 * num_gpus)
-    train_loader = DataLoader(train_dataset, batch_size=total_batch, shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=total_batch, shuffle=False, num_workers=4, pin_memory=True)
+    # Automatically handle batch size for local training
+    batch_size = args.batch_size if 'args' in locals() or 'args' in globals() else 8
+    effective_batch = args.effective_batch_size if 'args' in locals() or 'args' in globals() else 8
+    accumulation_steps = max(1, effective_batch // batch_size)
+    
+    print(f"Batch Size: {batch_size} | Effective Batch: {effective_batch} (Accumulation Steps: {accumulation_steps})")
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
     
     if num_gpus > 1:
         model = nn.DataParallel(model)
         
     optimizer = optim.Adam(model.parameters(), lr=LR)
+    # Optional: Use Adam with lower precision or specific flags if still OOM
+    # optimizer = optim.Adam(model.parameters(), lr=LR, eps=1e-4) 
+    
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
-    def weighted_mse_loss(input, target, f_weight=fluid_weight):
-        # Base weight is 1.0 (empty space)
+    def hybrid_loss(input, target, f_weight=fluid_weight, m_weight=effective_mass_weight):
+        # 1. Base Weighted Pixel-wise MSE
         weights = torch.ones_like(target)
-        # Boost pixels that contain actual fluid (using a small threshold for noise)
         weights[target > 0.05] = f_weight
+        mse_loss = torch.mean(weights * (input - target) ** 2)
         
-        # Calculate weighted square error
-        # .mean() remains normalized so LR stays predictable
-        return torch.mean(weights * (input - target) ** 2)
+        # 2. Global Mass Conservation (Total Density Sum)
+        # We use a squared error on the normalized sum difference
+        # We normalize by the total number of pixels to keep the scale comparable
+        if m_weight > 0:
+            mass_input = torch.sum(input, dim=(1, 2, 3))
+            mass_target = torch.sum(target, dim=(1, 2, 3))
+            mass_loss = torch.mean((mass_input - mass_target) ** 2) / (BUFFER_WIDTH * BUFFER_HEIGHT)
+            return mse_loss + m_weight * mass_loss
+            
+        return mse_loss
 
-    criterion = weighted_mse_loss
-    scaler = torch.amp.GradScaler('cuda')
+    criterion = hybrid_loss
+    
+    # BF16 doesn't need scaling
+    if is_bf16 and torch.cuda.is_bf16_supported():
+        scaler = None
+    else:
+        scaler = torch.amp.GradScaler('cuda')
 
     # Prepare loss logging
     log_file = os.path.join(run_dir, "losses.csv")
@@ -274,19 +329,49 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         model.train()
         total_train_loss = 0
         total_train_var = 0
-        for p_d, p_v, c_d, c_v, mask in train_loader:
+        optimizer.zero_grad(set_to_none=True)
+        
+        for i, (p_d, p_v, c_d, c_v, mask) in enumerate(train_loader):
             p_d, p_v, c_d, c_v, mask = p_d.to(device), p_v.to(device), c_d.to(device), c_v.to(device), mask.to(device)
-            optimizer.zero_grad(set_to_none=True)
             
-            with torch.amp.autocast('cuda'):
+            if is_bf16 and torch.cuda.is_bf16_supported():
+                p_d, p_v, c_d, c_v, mask = p_d.to(torch.bfloat16), p_v.to(torch.bfloat16), c_d.to(torch.bfloat16), c_v.to(torch.bfloat16), mask.to(torch.bfloat16)
+
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16 if is_bf16 else torch.float16):
                 output = model(p_d, p_v, c_d, c_v, mask)
-                loss = criterion(output, c_d)
-                total_train_loss += loss.item()
-                total_train_var += torch.var(output).item()
+                # Use float32 for loss stability
+                loss = criterion(output.to(torch.float32), c_d.to(torch.float32))
+                loss = loss / accumulation_steps
+                
+            if scaler:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
             
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            if (i + 1) % accumulation_steps == 0:
+                if scaler:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                
+            total_train_loss += (loss.item() * accumulation_steps)
+            total_train_var += torch.var(output).item()
+            
+            # Periodically Clear Fragments
+            if (i + 1) % 50 == 0:
+                torch.cuda.empty_cache()
+                gc.collect()
+        
+        # Handle leftover gradients if dataset size not divisible
+        if (len(train_loader) % accumulation_steps) != 0:
+            if scaler:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
         
         # --- VALIDATION LOOP ---
         model.eval()
@@ -298,13 +383,19 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         with torch.no_grad():
             for p_d, p_v, c_d, c_v, mask in val_loader:
                 p_d, p_v, c_d, c_v, mask = p_d.to(device), p_v.to(device), c_d.to(device), c_v.to(device), mask.to(device)
-                with torch.amp.autocast('cuda'):
+                
+                if is_bf16:
+                   p_d, p_v, c_d, c_v, mask = p_d.to(torch.bfloat16), p_v.to(torch.bfloat16), c_d.to(torch.bfloat16), c_v.to(torch.bfloat16), mask.to(torch.bfloat16)
+                
+                with torch.amp.autocast('cuda', dtype=torch.bfloat16 if is_bf16 else torch.float16):
                     output = model(p_d, p_v, c_d, c_v, mask)
-                    total_val_loss += criterion(output, c_d).item()
-                    total_val_zero += criterion(torch.zeros_like(c_d), c_d).item()
-                    total_val_ident += criterion(p_d, c_d).item()
-                    total_val_var += torch.var(output).item()
-                    total_val_gt_var += torch.var(c_d).item()
+                    total_val_loss += criterion(output.float(), c_d.float()).item()
+                    total_val_zero += criterion(torch.zeros_like(c_d).float(), c_d.float()).item()
+                    total_val_ident += criterion(p_d.float(), c_d.float()).item()
+                    total_val_var += torch.var(output.float()).item()
+                    total_val_gt_var += torch.var(c_d.float()).item()
+                
+                torch.cuda.empty_cache()
 
         # Reports normalized MSE
         avg_train_loss = total_train_loss / len(train_loader)
@@ -335,10 +426,17 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
+    parser.add_argument("--cycle", type=int, default=1, help="Current active learning cycle index")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--data_dir", type=str, default="data")
     parser.add_argument("--output_dir", type=str, default="attempts")
     parser.add_argument("--model_name", type=str, default="best_model.pth")
     parser.add_argument("--fluid_weight", type=float, default=50.0)
+    parser.add_argument("--mass_loss_weight", type=float, default=0.0)
+    parser.add_argument("--mass_loss_start_cycle", type=int, default=5, help="At what cycle to begin applying mass loss weight")
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--effective_batch_size", type=int, default=8)
+    parser.add_argument("--bf16", action="store_true", help="Use BFloat16 precision for memory savings")
     args = parser.parse_args()
-    train(args.epochs, args.data_dir, args.output_dir, args.model_name, args.fluid_weight)
+    train(args.epochs, args.data_dir, args.output_dir, args.model_name, args.fluid_weight, args.mass_loss_weight, args)
+

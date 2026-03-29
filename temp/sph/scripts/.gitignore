@@ -4,4 +4,4 @@ __pycache__/*
 env/*
 attempts/*
 logs/*
-
+best_model.pth

@@ -7,6 +7,8 @@ RUNS_PER_ITERATION=5  # How many simulations to start per cycle
 MAX_SESSIONS=5        # Keep only the last N simulation folders per run
 EPOCHS_PER_CLEAN=5   # Number of training epochs per cycle
 FRAMES_PER_RUN=500    # Number of frames per simulation run
+MASS_LOSS_START_CYCLE=5
+MASS_LOSS_WEIGHT=2.0
 
 # --- Unique Run Setup ---
 # Use first argument as RUN_NAME if provided, otherwise generate a unique one
@@ -49,10 +51,16 @@ for i in $(seq 1 $ITERATIONS); do
     # 3. TRAIN ON REMAINING DATA
     echo "Starting training session on all remaining data in $DATA_DIR..."
     python compressor.py \
+        --cycle $i \
         --epochs $EPOCHS_PER_CLEAN \
         --data_dir "$DATA_DIR" \
         --output_dir "$ATTEMPTS_DIR" \
-        --model_name "best_model.pth"
+        --model_name "best_model.pth" \
+        --mass_loss_weight $MASS_LOSS_WEIGHT \
+        --mass_loss_start_cycle $MASS_LOSS_START_CYCLE \
+        --batch_size 1 \
+        --effective_batch_size 8 \
+        --bf16
     
     echo "Cycle $i complete. Best model checkpoint updated in $ATTEMPTS_DIR."
 done
