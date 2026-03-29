@@ -130,9 +130,9 @@ class Decoder(nn.Module):
         super().__init__()
         self.fc = nn.Linear(latent_dim, 128 * 50 * 50)
         
-        # Downsamples prev_d to 50x50 bottleneck
-        self.prev_d_path = nn.Sequential(
-            nn.Conv2d(1, 64, 3, stride=2, padding=1),   # 200
+        # Downsamples prev_d + mask to 50x50 bottleneck
+        self.prev_context_path = nn.Sequential(
+            nn.Conv2d(2, 64, 3, stride=2, padding=1),   # 200 (prev_d + mask)
             ACT(),
             nn.Conv2d(64, 128, 3, stride=2, padding=1), # 100
             ACT(),
@@ -154,13 +154,13 @@ class Decoder(nn.Module):
         )
         self.final_act = nn.Sigmoid()
 
-    def forward(self, z, prev_d):
+    def forward(self, z, prev_d, mask):
         z_feat = self.fc(z).view(-1, 128, 50, 50)
-        d_feat = self.prev_d_path(prev_d)
+        # Contextual input: tell the decoder where the fluid was AND where the walls are
+        context_feat = self.prev_context_path(torch.cat([prev_d, mask], dim=1))
         
-        # Absolute Prediction: We still use prev_d as a feature input (d_feat),
-        # but we predict the entire next frame from scratch to avoid the 'Residual Annihilation' collapse.
-        raw_output = self.deconv(torch.cat([z_feat, d_feat], dim=1))
+        # Absolute Prediction: Reconstruction using both latent info and spatial context
+        raw_output = self.deconv(torch.cat([z_feat, context_feat], dim=1))
         return self.final_act(raw_output)
 
 class FullModel(nn.Module):
@@ -170,7 +170,7 @@ class FullModel(nn.Module):
         self.decoder = Decoder(latent_dim)
     def forward(self, p_d, p_v, c_d, c_v, mask):
         z = self.encoder(torch.cat([p_d, p_v, c_d, c_v, mask], dim=1))
-        return self.decoder(z, p_d)
+        return self.decoder(z, p_d, mask)
 
     def get_depth(self):
         count = 0
@@ -179,7 +179,7 @@ class FullModel(nn.Module):
                 count += 1
         return count
 
-def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_filename="best_model.pth"):
+def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_filename="best_model.pth", fluid_weight=50.0):
     num_gpus = torch.cuda.device_count()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Detected {num_gpus} GPU(s). Using device: {device}")
@@ -236,7 +236,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         f.write(f"Skip Frames: {skip_val}\n")
         f.write(f"Epochs per Cycle: {epochs}\n")
         f.write(f"Train/Val Split: {len(train_dirs)}/{len(val_dirs)}\n")
-        f.write(f"Loss Function: MSELoss\n")
+        f.write(f"Loss Function: WeightedMSE (Fluid Weight: {fluid_weight})\n")
         f.write(f"Normalizations: Density={DENSITY_NORM}, Velocity={VELOCITY_NORM}\n")
         f.write(f"Model Depth (Conv Layers): {model_depth}\n")
 
@@ -250,11 +250,11 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         
     optimizer = optim.Adam(model.parameters(), lr=LR)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
-    def weighted_mse_loss(input, target, fluid_weight=50.0):
+    def weighted_mse_loss(input, target, f_weight=fluid_weight):
         # Base weight is 1.0 (empty space)
         weights = torch.ones_like(target)
         # Boost pixels that contain actual fluid (using a small threshold for noise)
-        weights[target > 0.05] = fluid_weight
+        weights[target > 0.05] = f_weight
         
         # Calculate weighted square error
         # .mean() remains normalized so LR stays predictable
@@ -339,5 +339,6 @@ if __name__ == "__main__":
     parser.add_argument("--data_dir", type=str, default="data")
     parser.add_argument("--output_dir", type=str, default="attempts")
     parser.add_argument("--model_name", type=str, default="best_model.pth")
+    parser.add_argument("--fluid_weight", type=float, default=50.0)
     args = parser.parse_args()
-    train(args.epochs, args.data_dir, args.output_dir, args.model_name)
+    train(args.epochs, args.data_dir, args.output_dir, args.model_name, args.fluid_weight)
