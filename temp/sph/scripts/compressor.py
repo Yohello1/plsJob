@@ -208,7 +208,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         return
 
     # 1. Configuration & Constants
-    LR = 1e-4
+    LR = 5e-5
     LATENT_DIM_LOCAL = LATENT_DIM
     # The dataset default skip is 10, but we can access it from dataset if needed
     
@@ -294,21 +294,27 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
     def hybrid_loss(input, target, f_weight=fluid_weight, m_weight=effective_mass_weight):
-        # 1. Base Weighted Pixel-wise MSE
-        weights = torch.ones_like(target)
-        weights[target > 0.05] = f_weight
-        mse_loss = torch.mean(weights * (input - target) ** 2)
-        
-        # 2. Global Mass Conservation (Total Density Sum)
-        # We use a squared error on the normalized sum difference
-        # We normalize by the total number of pixels to keep the scale comparable
+        # Create mask for fluid vs background
+        fluid_mask = (target > 0.05).float()
+        background_mask = 1.0 - fluid_mask
+
+        # Calculate MSE for both regions separately
+        mse_fluid = torch.sum(fluid_mask * (input - target) ** 2) / (fluid_mask.sum() + 1e-6)
+        mse_bg = torch.sum(background_mask * (input - target) ** 2) / (background_mask.sum() + 1e-6)
+
+        # Combine them: f_weight now acts as a relative importance ratio
+        # (e.g., 1.0 means fluid and background are equally important)
+        mse_total = (f_weight * mse_fluid) + mse_bg
+
+        # Global Mass Conservation
         if m_weight > 0:
             mass_input = torch.sum(input, dim=(1, 2, 3))
             mass_target = torch.sum(target, dim=(1, 2, 3))
+            # Log-space or relative mass error often scales better than raw squared sum
             mass_loss = torch.mean((mass_input - mass_target) ** 2) / (BUFFER_WIDTH * BUFFER_HEIGHT)
-            return mse_loss + m_weight * mass_loss
-            
-        return mse_loss
+            return mse_total + m_weight * mass_loss
+
+        return mse_total
 
     criterion = hybrid_loss
     
@@ -431,7 +437,7 @@ if __name__ == "__main__":
     parser.add_argument("--data_dir", type=str, default="data")
     parser.add_argument("--output_dir", type=str, default="attempts")
     parser.add_argument("--model_name", type=str, default="best_model.pth")
-    parser.add_argument("--fluid_weight", type=float, default=50.0)
+    parser.add_argument("--fluid_weight", type=float, default=25.0)
     parser.add_argument("--mass_loss_weight", type=float, default=0.0)
     parser.add_argument("--mass_loss_start_cycle", type=int, default=5, help="At what cycle to begin applying mass loss weight")
     parser.add_argument("--batch_size", type=int, default=1)
