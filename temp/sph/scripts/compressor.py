@@ -33,12 +33,13 @@ class ResBlock(nn.Module):
     """Residual block to help deeper networks learn more effectively."""
     def __init__(self, c):
         super().__init__()
+        # Using GroupNorm instead of BatchNorm for better stability (especially with batch_size=1)
         self.conv = nn.Sequential(
             nn.Conv2d(c, c, 3, padding=1),
-            nn.BatchNorm2d(c),
+            nn.GroupNorm(8, c), # 8 groups is a robust default
             ACT(),
             nn.Conv2d(c, c, 3, padding=1),
-            nn.BatchNorm2d(c)
+            nn.GroupNorm(8, c)
         )
     def _inner_forward(self, x):
         return ACT()(x + self.conv(x))
@@ -186,6 +187,52 @@ class FullModel(nn.Module):
                 count += 1
         return count
 
+def find_max_batch_size(model, device, is_bf16=False):
+    """Auto-detects the largest power-of-2 (or multiple) batch size that fits in VRAM."""
+    print("Auto-detecting maximum possible batch size...")
+    torch.cuda.empty_cache()
+    gc.collect()
+    
+    # Mock inputs matching FullModel.forward(p_d, p_v, c_d, c_v, mask)
+    p_d = torch.randn(1, 1, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
+    p_v = torch.randn(1, 2, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
+    c_d = torch.randn(1, 1, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
+    c_v = torch.randn(1, 2, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
+    mask = torch.randn(1, 1, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
+    
+    if is_bf16:
+        p_d, p_v, c_d, c_v, mask = [t.to(torch.bfloat16) for t in [p_d, p_v, c_d, c_v, mask]]
+
+    model.train()
+    found_batch = 1
+    # Try common tensor-core friendly batch sizes
+    candidates = [1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128]
+    
+    for b in candidates:
+        try:
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16 if is_bf16 else torch.float16):
+                # Using expand avoids actual memory copy until the forward pass
+                out = model(p_d.expand(b, -1, -1, -1), 
+                            p_v.expand(b, -1, -1, -1),
+                            c_d.expand(b, -1, -1, -1),
+                            c_v.expand(b, -1, -1, -1),
+                            mask.expand(b, -1, -1, -1))
+                loss = out.sum()
+            loss.backward()
+            model.zero_grad(set_to_none=True)
+            found_batch = b
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                torch.cuda.empty_cache()
+                break
+            else:
+                raise e
+    
+    print(f"Max batch size found: {found_batch}")
+    torch.cuda.empty_cache()
+    gc.collect()
+    return found_batch
+
 def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_filename="best_model.pth", fluid_weight=50.0, mass_loss_weight=0.0, args=None):
     # Determine effective mass loss weight based on curriculum
     current_cycle = args.cycle if args and hasattr(args, 'cycle') else 1
@@ -247,7 +294,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         for m in model.modules():
             if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d, nn.LayerNorm, nn.GroupNorm)):
                 m.float()
-        print("Enabled BFloat16 Precision (BatchNorm/Normalization kept in Float32)")
+        print("Enabled BFloat16 Precision (Norm layers kept in Float32 for stability)")
     else:
         is_bf16 = False
     
@@ -276,8 +323,17 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
 
     # 5. Data Pipelines
     # Automatically handle batch size for local training
-    batch_size = args.batch_size if 'args' in locals() or 'args' in globals() else 8
-    effective_batch = args.effective_batch_size if 'args' in locals() or 'args' in globals() else 8
+    batch_size = args.batch_size if args and hasattr(args, 'batch_size') else 1
+    effective_batch = args.effective_batch_size if args and hasattr(args, 'effective_batch_size') else 8
+    
+    if batch_size == 0:
+        # Find limit on a single GPU first, then scale
+        found_limit = find_max_batch_size(model, device, is_bf16)
+        batch_size = found_limit * max(1, num_gpus)
+        print(f"Final training batch size set to: {batch_size} ({found_limit} per GPU)")
+        # If batch size is already large enough, skip accumulation
+        effective_batch = max(effective_batch, batch_size)
+    
     accumulation_steps = max(1, effective_batch // batch_size)
     
     print(f"Batch Size: {batch_size} | Effective Batch: {effective_batch} (Accumulation Steps: {accumulation_steps})")
@@ -440,8 +496,8 @@ if __name__ == "__main__":
     parser.add_argument("--fluid_weight", type=float, default=25.0)
     parser.add_argument("--mass_loss_weight", type=float, default=0.0)
     parser.add_argument("--mass_loss_start_cycle", type=int, default=5, help="At what cycle to begin applying mass loss weight")
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--effective_batch_size", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=0, help="0 = Auto-detect maximum for GPU, >0 = fixed size")
+    parser.add_argument("--effective_batch_size", type=int, default=8, help="Target batch size for optimization steps (achieved via accumulation)")
     parser.add_argument("--bf16", action="store_true", help="Use BFloat16 precision for memory savings")
     args = parser.parse_args()
     train(args.epochs, args.data_dir, args.output_dir, args.model_name, args.fluid_weight, args.mass_loss_weight, args)

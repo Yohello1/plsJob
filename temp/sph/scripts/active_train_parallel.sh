@@ -16,7 +16,7 @@ source env/bin/activate
 ITERATIONS=20         # Total cycles
 RUNS_PER_ITERATION=10 # Parallel simulations per cycle
 MAX_SESSIONS=30       # Keep last N folders per run
-EPOCHS_PER_CLEAN=5    # Training epochs per cycle
+EPOCHS_PER_CLEAN=7    # Training epochs per cycle
 FRAMES_PER_RUN=200    # Frames per simulation
 MASS_LOSS_START_CYCLE=5
 MASS_LOSS_WEIGHT=2.0
@@ -74,7 +74,7 @@ for i in $(seq 1 $ITERATIONS); do
         --model_name "best_model.pth" \
         --mass_loss_weight $MASS_LOSS_WEIGHT \
         --mass_loss_start_cycle $MASS_LOSS_START_CYCLE \
-        --batch_size 1 \
+        --batch_size 0 \
         --effective_batch_size 8 \
         --bf16
     

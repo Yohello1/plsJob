@@ -58,7 +58,7 @@ for i in $(seq 1 $ITERATIONS); do
         --model_name "best_model.pth" \
         --mass_loss_weight $MASS_LOSS_WEIGHT \
         --mass_loss_start_cycle $MASS_LOSS_START_CYCLE \
-        --batch_size 1 \
+        --batch_size 0 \
         --effective_batch_size 8 \
         --bf16
     
