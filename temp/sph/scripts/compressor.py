@@ -288,8 +288,21 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     val_dataset = SPHDataset(val_dirs)
     skip_val = train_dataset.skip
 
-    # Initialize model early to get depth for logging
+    # Initialize model
     model = FullModel(LATENT_DIM_LOCAL).to(device)
+    
+    # NEW: LOAD PERSISTENT WEIGHTS
+    # This allows Active Learning to actually "build" on previous cycles
+    pretrained_path = os.path.join(output_dir, model_filename)
+    if os.path.exists(pretrained_path):
+        try:
+            print(f"Loading existing weights from {pretrained_path} (Incremental Learning)...")
+            state_dict = torch.load(pretrained_path, map_location=device, weights_only=True)
+            model.load_state_dict(state_dict)
+        except Exception as e:
+            print(f"Warning: Could not load pretrained weights ({e}). Starting from scratch.")
+    else:
+        print("No previous model found. Starting training from random initialization.")
     
     # Precision Control: BF16 saves ~2.4GB on weights/grads for this model
     is_bf16 = args.bf16 if args and hasattr(args, 'bf16') else False
