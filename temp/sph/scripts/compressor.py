@@ -136,9 +136,10 @@ class Encoder(nn.Module):
 class Decoder(nn.Module):
     def __init__(self, latent_dim=1024):
         super().__init__()
+        # Maintaining original 128-channel bottleneck
         self.fc = nn.Linear(latent_dim, 128 * 50 * 50)
         
-        # Downsamples prev_d + mask to 50x50 bottleneck
+        # Downsamples prev_d + mask to 50x50 bottleneck (original dimensions)
         self.prev_context_path = nn.Sequential(
             nn.Conv2d(2, 64, 3, stride=2, padding=1),   # 200 (prev_d + mask)
             ACT(),
@@ -148,16 +149,19 @@ class Decoder(nn.Module):
             ACT(),
         )
         
-        # Upsamples from 50x50 back to 400x400
+        # Sub-pixel Convolution (PixelShuffle) for sharp upsampling (Maintains original channel progression)
         self.deconv = nn.Sequential(
-            nn.Upsample(size=(100,100), mode='bilinear', align_corners=False),
-            nn.Conv2d(256, 128, 3, padding=1), 
+            # 50x50 -> 100x100
+            nn.Conv2d(256, 512, 3, padding=1),  # (128 context + 128 z) = 256
+            nn.PixelShuffle(2),                 # 512 -> 128 output
             ResBlock(128),
-            nn.Upsample(size=(200,200), mode='bilinear', align_corners=False),
-            nn.Conv2d(128, 64, 3, padding=1),
+            # 100x100 -> 200x200
+            nn.Conv2d(128, 256, 3, padding=1), 
+            nn.PixelShuffle(2),                 # 256 -> 64 output
             ResBlock(64),
-            nn.Upsample(size=(400,400), mode='bilinear', align_corners=False),
-            nn.Conv2d(64, 1, 3, padding=1),
+            # 200x200 -> 400x400
+            nn.Conv2d(64, 4, 3, padding=1), 
+            nn.PixelShuffle(2),                 # 4 -> 1 output
             # Final output will be added to prev_d, so no activation here
         )
         self.final_act = nn.Sigmoid()
@@ -168,6 +172,7 @@ class Decoder(nn.Module):
         context_feat = self.prev_context_path(torch.cat([prev_d, mask], dim=1))
         
         # Absolute Prediction: Reconstruction using both latent info and spatial context
+        # Maintains the original concatenation pattern
         raw_output = self.deconv(torch.cat([z_feat, context_feat], dim=1))
         return self.final_act(raw_output)
 
@@ -349,7 +354,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     # optimizer = optim.Adam(model.parameters(), lr=LR, eps=1e-4) 
     
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
-    def hybrid_loss(input, target, f_weight=fluid_weight, m_weight=effective_mass_weight):
+    def hybrid_loss(input, target, f_weight=fluid_weight, m_weight=effective_mass_weight, grad_weight=15.0):
         # Create mask for fluid vs background
         fluid_mask = (target > 0.05).float()
         background_mask = 1.0 - fluid_mask
@@ -357,19 +362,29 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         # Calculate MSE for both regions separately
         mse_fluid = torch.sum(fluid_mask * (input - target) ** 2) / (fluid_mask.sum() + 1e-6)
         mse_bg = torch.sum(background_mask * (input - target) ** 2) / (background_mask.sum() + 1e-6)
-
-        # Combine them: f_weight now acts as a relative importance ratio
-        # (e.g., 1.0 means fluid and background are equally important)
         mse_total = (f_weight * mse_fluid) + mse_bg
+
+        # Grad Consistency Term: Forces the model to match sharp edges
+        in_dx = input[:, :, 1:, :] - input[:, :, :-1, :]
+        in_dy = input[:, :, :, 1:] - input[:, :, :, :-1]
+        tg_dx = target[:, :, 1:, :] - target[:, :, :-1, :]
+        tg_dy = target[:, :, :, 1:] - target[:, :, :, :-1]
+        f_mask_dx = fluid_mask[:, :, 1:, :]
+        f_mask_dy = fluid_mask[:, :, :, 1:]
+        
+        grad_loss = (torch.sum(f_mask_dx * (in_dx - tg_dx)**2) / (f_mask_dx.sum() + 1e-6) +
+                     torch.sum(f_mask_dy * (in_dy - tg_dy)**2) / (f_mask_dy.sum() + 1e-6))
+
+        total_loss = mse_total + (grad_weight * grad_loss)
 
         # Global Mass Conservation (Normalized to Mean to match MSE scale)
         if m_weight > 0:
             mass_input = torch.mean(input, dim=(1, 2, 3))
             mass_target = torch.mean(target, dim=(1, 2, 3))
             mass_loss = torch.mean((mass_input - mass_target) ** 2)
-            return mse_total + m_weight * mass_loss
+            total_loss += m_weight * mass_loss
 
-        return mse_total
+        return total_loss
 
     criterion = hybrid_loss
     
