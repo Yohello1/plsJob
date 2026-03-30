@@ -362,12 +362,11 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         # (e.g., 1.0 means fluid and background are equally important)
         mse_total = (f_weight * mse_fluid) + mse_bg
 
-        # Global Mass Conservation
+        # Global Mass Conservation (Normalized to Mean to match MSE scale)
         if m_weight > 0:
-            mass_input = torch.sum(input, dim=(1, 2, 3))
-            mass_target = torch.sum(target, dim=(1, 2, 3))
-            # Log-space or relative mass error often scales better than raw squared sum
-            mass_loss = torch.mean((mass_input - mass_target) ** 2) / (BUFFER_WIDTH * BUFFER_HEIGHT)
+            mass_input = torch.mean(input, dim=(1, 2, 3))
+            mass_target = torch.mean(target, dim=(1, 2, 3))
+            mass_loss = torch.mean((mass_input - mass_target) ** 2)
             return mse_total + m_weight * mass_loss
 
         return mse_total
