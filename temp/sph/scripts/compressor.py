@@ -29,6 +29,14 @@ ACTIVATION_LOOKUP = {
 }
 ACT = ACTIVATION_LOOKUP[ACTIVATION_TYPE]
 
+def get_coord_grid(batch_size, h, w, device):
+    """Generates X and Y coordinate channels ranging from -1 to 1."""
+    yy = torch.linspace(-1, 1, h, device=device)
+    xx = torch.linspace(-1, 1, w, device=device)
+    grid_y, grid_x = torch.meshgrid(yy, xx, indexing='ij')
+    grid = torch.stack([grid_x, grid_y], dim=0) # [2, H, W]
+    return grid.unsqueeze(0).repeat(batch_size, 1, 1, 1)
+
 class ResBlock(nn.Module):
     """Residual block to help deeper networks learn more effectively."""
     def __init__(self, c):
@@ -141,9 +149,9 @@ class SPHDataset(Dataset):
 class Encoder(nn.Module):
     def __init__(self, latent_dim=1024):
         super().__init__()
-        # 400x7 -> 200x64 -> 100x128 -> 50x128
+        # Input channels: p_d(1), p_v(2), c_d(1), c_v(2), mask(1) + COORD_X(1), COORD_Y(1) = 9
         self.conv = nn.Sequential(
-            nn.Conv2d(7, 64, 3, stride=2, padding=1),   # Input channels: p_d(1), p_v(2), c_d(1), c_v(2), mask(1)
+            nn.Conv2d(9, 64, 3, stride=2, padding=1),   
             ResBlock(64),
             nn.Conv2d(64, 128, 3, stride=2, padding=1), 
             ResBlock(128),
@@ -159,45 +167,54 @@ class Encoder(nn.Module):
 class Decoder(nn.Module):
     def __init__(self, latent_dim=1024):
         super().__init__()
-        # Maintaining original 128-channel bottleneck
+        # Bottleneck mapping
         self.fc = nn.Linear(latent_dim, 128 * 50 * 50)
         
-        # Downsamples prev_d + mask to 50x50 bottleneck (original dimensions)
-        self.prev_context_path = nn.Sequential(
-            nn.Conv2d(2, 64, 3, stride=2, padding=1),   # 200 (prev_d + mask)
-            ACT(),
-            nn.Conv2d(64, 128, 3, stride=2, padding=1), # 100
-            ACT(),
-            nn.Conv2d(128, 128, 3, stride=2, padding=1),# 50
-            ACT(),
+        # STREAMING-FRIENDLY CONTEXT: Borrow sharp edges + absolute coordinates
+        # Input channels: prev_d(1), mask(1), coord_x(1), coord_y(1) = 4
+        self.context_400 = nn.Sequential(nn.Conv2d(4, 16, 3, padding=1), ACT())
+        self.context_200 = nn.Sequential(nn.Conv2d(16, 32, 3, stride=2, padding=1), ACT())
+        self.context_100 = nn.Sequential(nn.Conv2d(32, 64, 3, stride=2, padding=1), ACT())
+        self.context_50  = nn.Sequential(nn.Conv2d(64, 128, 3, stride=2, padding=1), ACT())
+        
+        # Sub-pixel Convolution (PixelShuffle) with context injection
+        # 50x50 Stage
+        self.up_50_to_100 = nn.Sequential(
+            nn.Conv2d(128 + 128, 512, 3, padding=1), # (z + context_50)
+            nn.PixelShuffle(2),                      # Output: 128 channels, 100x100
+            ResBlock(128)
+        )
+        # 100x100 Stage
+        self.up_100_to_200 = nn.Sequential(
+            nn.Conv2d(128 + 64, 256, 3, padding=1), # (up_128 + context_100)
+            nn.PixelShuffle(2),                      # Output: 64 channels, 200x200
+            ResBlock(64)
+        )
+        # 200x200 Stage
+        self.up_200_to_400 = nn.Sequential(
+            nn.Conv2d(64 + 32, 4, 3, padding=1),   # (up_64 + context_200)
+            nn.PixelShuffle(2)                       # Output: 1 channel, 400x400
         )
         
-        # Sub-pixel Convolution (PixelShuffle) for sharp upsampling (Maintains original channel progression)
-        self.deconv = nn.Sequential(
-            # 50x50 -> 100x100
-            nn.Conv2d(256, 512, 3, padding=1),  # (128 context + 128 z) = 256
-            nn.PixelShuffle(2),                 # 512 -> 128 output
-            ResBlock(128),
-            # 100x100 -> 200x200
-            nn.Conv2d(128, 256, 3, padding=1), 
-            nn.PixelShuffle(2),                 # 256 -> 64 output
-            ResBlock(64),
-            # 200x200 -> 400x400
-            nn.Conv2d(64, 4, 3, padding=1), 
-            nn.PixelShuffle(2),                 # 4 -> 1 output
-            # Final output will be added to prev_d, so no activation here
-        )
         self.final_act = nn.Sigmoid()
 
-    def forward(self, z, prev_d, mask):
-        z_feat = self.fc(z).view(-1, 128, 50, 50)
-        # Contextual input: tell the decoder where the fluid was AND where the walls are
-        context_feat = self.prev_context_path(torch.cat([prev_d, mask], dim=1))
+    def forward(self, z, prev_d, mask, coords):
+        # 1. Map bottleneck to 50x50
+        x = self.fc(z).view(-1, 128, 50, 50)
         
-        # Absolute Prediction: Reconstruction using both latent info and spatial context
-        # Maintains the original concatenation pattern
-        raw_output = self.deconv(torch.cat([z_feat, context_feat], dim=1))
-        return self.final_act(raw_output)
+        # 2. Extract Context "Blueprints" from Previous Frame + Mask + Coords
+        ctx_400 = self.context_400(torch.cat([prev_d, mask, coords], dim=1))
+        ctx_200 = self.context_200(ctx_400)
+        ctx_100 = self.context_100(ctx_200)
+        ctx_50  = self.context_50(ctx_100)
+        
+        # 3. Upsample while injecting high-res context at each step
+        x = self.up_50_to_100(torch.cat([x, ctx_50], dim=1))
+        x = self.up_100_to_200(torch.cat([x, ctx_100], dim=1))
+        # Inject the 200x200 details right before the final 400x400 expansion
+        x = self.up_200_to_400(torch.cat([x, ctx_200], dim=1))
+        
+        return self.final_act(x)
 
 class FullModel(nn.Module):
     def __init__(self, latent_dim=1024):
@@ -205,8 +222,10 @@ class FullModel(nn.Module):
         self.encoder = Encoder(latent_dim)
         self.decoder = Decoder(latent_dim)
     def forward(self, p_d, p_v, c_d, c_v, mask):
-        z = self.encoder(torch.cat([p_d, p_v, c_d, c_v, mask], dim=1))
-        return self.decoder(z, p_d, mask)
+        coords = get_coord_grid(p_d.size(0), BUFFER_HEIGHT, BUFFER_WIDTH, p_d.device).to(p_d.dtype)
+        # 9 channels: p_d(1), p_v(2), c_d(1), c_v(2), mask(1), coords(2)
+        z = self.encoder(torch.cat([p_d, p_v, c_d, c_v, mask, coords], dim=1))
+        return self.decoder(z, p_d, mask, coords)
 
     def get_depth(self):
         count = 0
@@ -379,8 +398,8 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     
     print(f"Batch Size: {batch_size} | Effective Batch: {effective_batch} (Accumulation Steps: {accumulation_steps})")
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=12, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=12, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=8, pin_memory=True)
     
     if num_gpus > 1:
         model = nn.DataParallel(model)
