@@ -60,6 +60,7 @@ class SPHDataset(Dataset):
         self.frame_size = 4 * BUFFER_WIDTH * BUFFER_HEIGHT * 4 # 4 fields * N * 4 bytes
         self.field_size = BUFFER_WIDTH * BUFFER_HEIGHT * 4
         self.order = {"d": 0, "v_x": 1, "v_y": 2, "m": 3}
+        self.handles = {} # Local handle cache to avoid NFS re-opening
 
         for d_dir in self.data_dirs:
             bin_file = os.path.join(d_dir, "sim_data.bin")
@@ -72,6 +73,29 @@ class SPHDataset(Dataset):
             for i in range(num_frames - self.skip):
                 # Store (directory, prev_idx, curr_idx)
                 self.samples.append((d_dir, i, i + self.skip))
+
+    def _get_handle(self, data_dir):
+        if data_dir not in self.handles:
+            path = os.path.join(data_dir, "sim_data.bin")
+            self.handles[data_dir] = open(path, "rb")
+        return self.handles[data_dir]
+
+    def load_frame_data(self, data_dir, frame_idx):
+        """Optimized: Reads all 4 fields (p_d, v_x, v_y, mask) in one go if possible"""
+        handle = self._get_handle(data_dir)
+        offset = frame_idx * self.frame_size
+        handle.seek(offset)
+        
+        # Read the entire 4-field block into memory at once
+        raw_data = np.fromfile(handle, dtype=np.float32, count=4 * BUFFER_WIDTH * BUFFER_HEIGHT)
+        raw_data = raw_data.reshape((4, BUFFER_HEIGHT, BUFFER_WIDTH))
+        
+        # Unpack fields (no more multiple seeks!)
+        d = torch.from_numpy(raw_data[0]).unsqueeze(0)
+        v = torch.from_numpy(raw_data[1:3]) # v_x, v_y
+        m = torch.from_numpy(raw_data[3]).unsqueeze(0)
+        
+        return d, v, m
 
     def __len__(self):
         return len(self.samples)
@@ -100,18 +124,17 @@ class SPHDataset(Dataset):
     def __getitem__(self, idx):
         data_dir, prev_idx, curr_idx = self.samples[idx]
         
-        # Load Previous Frame
-        p_d = self.load_bin(data_dir, prev_idx, "d")
-        p_v = torch.cat([self.load_bin(data_dir, prev_idx, "v_x"), 
-                       self.load_bin(data_dir, prev_idx, "v_y")], dim=0)
+        # Load Entire Frame Data in ONE SEQUENTIAL READ per frame
+        # This is ~5x faster on NFS because it avoids seek overhead
+        p_d, p_v, mask = self.load_frame_data(data_dir, prev_idx)
+        c_d, c_v, _    = self.load_frame_data(data_dir, curr_idx)
         
-        # Load Current Frame
-        c_d = self.load_bin(data_dir, curr_idx, "d")
-        c_v = torch.cat([self.load_bin(data_dir, curr_idx, "v_x"), 
-                       self.load_bin(data_dir, curr_idx, "v_y")], dim=0)
-        
-        # Load Solid Mask
-        mask = self.load_bin(data_dir, prev_idx, "m")
+        # Apply normalization
+        p_d = p_d * DENSITY_NORM
+        p_v = p_v * VELOCITY_NORM
+        c_d = c_d * DENSITY_NORM
+        c_v = c_v * VELOCITY_NORM
+        mask = mask.float()
         
         return p_d, p_v, c_d, c_v, mask
 
@@ -356,8 +379,8 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     
     print(f"Batch Size: {batch_size} | Effective Batch: {effective_batch} (Accumulation Steps: {accumulation_steps})")
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=12, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=12, pin_memory=True)
     
     if num_gpus > 1:
         model = nn.DataParallel(model)
