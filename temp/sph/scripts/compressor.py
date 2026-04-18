@@ -446,7 +446,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     # optimizer = optim.Adam(model.parameters(), lr=LR, eps=1e-4) 
     
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
-    def hybrid_loss(input, target, f_weight=fluid_weight, m_weight=effective_mass_weight, grad_weight=15.0, prev_frame=None):
+    def hybrid_loss(input, target, f_weight=fluid_weight, m_weight=effective_mass_weight, grad_weight=5.0, prev_frame=None):
         # 1. Spatial Masks: Separate the fluid from the background
         fluid_mask = (target > 0.05).float()
         background_mask = 1.0 - fluid_mask
