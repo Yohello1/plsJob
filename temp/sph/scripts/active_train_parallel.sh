@@ -20,6 +20,8 @@ EPOCHS_PER_CLEAN=7    # Training epochs per cycle
 FRAMES_PER_RUN=200    # Frames per simulation
 MASS_LOSS_START_CYCLE=5
 MASS_LOSS_WEIGHT=2.0
+NOISE_STD=0.005        # Small noise to improve stability
+AR_STEPS=1             # Number of autoregressive steps (start with 1, increase to 2-4 later)
 
 # --- Unique Run Setup ---
 # Use first argument as RUN_NAME if provided, otherwise generate a unique one
@@ -76,6 +78,8 @@ for i in $(seq 1 $ITERATIONS); do
         --mass_loss_start_cycle $MASS_LOSS_START_CYCLE \
         --batch_size 0 \
         --effective_batch_size 8 \
+        --noise_std $NOISE_STD \
+        --ar_steps $AR_STEPS \
         --bf16
     
     echo "Cycle $i complete."

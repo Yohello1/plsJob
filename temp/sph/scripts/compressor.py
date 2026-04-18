@@ -58,12 +58,13 @@ class ResBlock(nn.Module):
         return self._inner_forward(x)
 
 class SPHDataset(Dataset):
-    def __init__(self, data_dirs, skip=10):
+    def __init__(self, data_dirs, skip=10, n_steps=1):
         if isinstance(data_dirs, str):
             data_dirs = [data_dirs]
         self.data_dirs = data_dirs
         self.samples = []
         self.skip = skip
+        self.n_steps = n_steps
         
         self.frame_size = 4 * BUFFER_WIDTH * BUFFER_HEIGHT * 4 # 4 fields * N * 4 bytes
         self.field_size = BUFFER_WIDTH * BUFFER_HEIGHT * 4
@@ -78,9 +79,10 @@ class SPHDataset(Dataset):
             file_size = os.path.getsize(bin_file)
             num_frames = file_size // self.frame_size
             
-            for i in range(num_frames - self.skip):
-                # Store (directory, prev_idx, curr_idx)
-                self.samples.append((d_dir, i, i + self.skip))
+            for i in range(num_frames - self.skip * self.n_steps):
+                # Store (directory, start_idx)
+                # We can calculate all subsequent indices using start_idx + k*skip
+                self.samples.append((d_dir, i))
 
     def _get_handle(self, data_dir):
         if data_dir not in self.handles:
@@ -130,21 +132,27 @@ class SPHDataset(Dataset):
         return tensor
 
     def __getitem__(self, idx):
-        data_dir, prev_idx, curr_idx = self.samples[idx]
+        data_dir, start_idx = self.samples[idx]
         
-        # Load Entire Frame Data in ONE SEQUENTIAL READ per frame
-        # This is ~5x faster on NFS because it avoids seek overhead
-        p_d, p_v, mask = self.load_frame_data(data_dir, prev_idx)
-        c_d, c_v, _    = self.load_frame_data(data_dir, curr_idx)
+        densities = []
+        velocities = []
         
-        # Apply normalization
-        p_d = p_d * DENSITY_NORM
-        p_v = p_v * VELOCITY_NORM
-        c_d = c_d * DENSITY_NORM
-        c_v = c_v * VELOCITY_NORM
-        mask = mask.float()
+        # Load n_steps + 1 frames
+        for step in range(self.n_steps + 1):
+            frame_idx = start_idx + step * self.skip
+            d, v, m = self.load_frame_data(data_dir, frame_idx)
+            
+            # Apply normalization
+            d = d * DENSITY_NORM
+            v = v * VELOCITY_NORM
+            
+            densities.append(d)
+            velocities.append(v)
+            if step == 0:
+                mask = m.float()
         
-        return p_d, p_v, c_d, c_v, mask
+        # Return as tensors: [T+1, 1, H, W] and [T+1, 2, H, W]
+        return torch.stack(densities), torch.stack(velocities), mask
 
 class Encoder(nn.Module):
     def __init__(self, latent_dim=1024):
@@ -234,7 +242,7 @@ class FullModel(nn.Module):
                 count += 1
         return count
 
-def find_max_batch_size(model, device, is_bf16=False):
+def find_max_batch_size(model, device, is_bf16=False, ar_steps=1):
     """Auto-detects the largest power-of-2 (or multiple) batch size that fits in VRAM."""
     print("Auto-detecting maximum possible batch size...")
     torch.cuda.empty_cache()
@@ -258,14 +266,19 @@ def find_max_batch_size(model, device, is_bf16=False):
     for b in candidates:
         try:
             with torch.amp.autocast('cuda', dtype=torch.bfloat16 if is_bf16 else torch.float16):
-                # Using expand avoids actual memory copy until the forward pass
-                out = model(p_d.expand(b, -1, -1, -1), 
-                            p_v.expand(b, -1, -1, -1),
-                            c_d.expand(b, -1, -1, -1),
-                            c_v.expand(b, -1, -1, -1),
-                            mask.expand(b, -1, -1, -1))
-                loss = out.sum()
-            loss.backward()
+                # Simulate AR steps to check memory limit
+                context_d = p_d.expand(b, -1, -1, -1)
+                for _ in range(ar_steps):
+                    # Mock forward pass logic
+                    out = model(context_d, 
+                                p_v.expand(b, -1, -1, -1),
+                                c_d.expand(b, -1, -1, -1),
+                                c_v.expand(b, -1, -1, -1),
+                                mask.expand(b, -1, -1, -1))
+                    context_d = out # Predictor loop
+                    loss = out.sum()
+                    loss.backward(retain_graph=True) # Retain graph if multi-step backprop
+            
             model.zero_grad(set_to_none=True)
             found_batch = b
         except RuntimeError as e:
@@ -326,8 +339,9 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     val_dirs = session_dirs[split_idx:]
     print(f"Dataset split: {len(train_dirs)} training sessions, {len(val_dirs)} validation sessions.")
 
-    train_dataset = SPHDataset(train_dirs)
-    val_dataset = SPHDataset(val_dirs)
+    ar_steps = args.ar_steps if args and hasattr(args, 'ar_steps') else 1
+    train_dataset = SPHDataset(train_dirs, n_steps=ar_steps)
+    val_dataset = SPHDataset(val_dirs, n_steps=ar_steps)
     skip_val = train_dataset.skip
 
     # Initialize model
@@ -380,6 +394,8 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         f.write(f"Mass Loss Start Cycle: {start_cycle}\n")
         f.write(f"Effective Mass Loss Weight: {effective_mass_weight}\n")
         f.write(f"Model Depth (Conv Layers): {model_depth}\n")
+        f.write(f"AR Steps: {ar_steps}\n")
+        f.write(f"Noise Std: {args.noise_std if args else 0.0}\n")
 
     # 5. Data Pipelines
     # Automatically handle batch size for local training
@@ -388,7 +404,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     
     if batch_size == 0:
         # Find limit on a single GPU first, then scale
-        found_limit = find_max_batch_size(model, device, is_bf16)
+        found_limit = find_max_batch_size(model, device, is_bf16, ar_steps=ar_steps)
         batch_size = found_limit * max(1, num_gpus)
         print(f"Final training batch size set to: {batch_size} ({found_limit} per GPU)")
         # If batch size is already large enough, skip accumulation
@@ -462,17 +478,48 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         total_train_var = 0
         optimizer.zero_grad(set_to_none=True)
         
-        for i, (p_d, p_v, c_d, c_v, mask) in enumerate(train_loader):
-            p_d, p_v, c_d, c_v, mask = p_d.to(device), p_v.to(device), c_d.to(device), c_v.to(device), mask.to(device)
+        for i, (densities, velocities, mask) in enumerate(train_loader):
+            densities, velocities, mask = densities.to(device), velocities.to(device), mask.to(device)
             
             if is_bf16 and torch.cuda.is_bf16_supported():
-                p_d, p_v, c_d, c_v, mask = p_d.to(torch.bfloat16), p_v.to(torch.bfloat16), c_d.to(torch.bfloat16), c_v.to(torch.bfloat16), mask.to(torch.bfloat16)
+                densities, velocities, mask = densities.to(torch.bfloat16), velocities.to(torch.bfloat16), mask.to(torch.bfloat16)
 
             with torch.amp.autocast('cuda', dtype=torch.bfloat16 if is_bf16 else torch.float16):
-                output = model(p_d, p_v, c_d, c_v, mask)
-                # Use float32 for loss stability
-                loss = criterion(output.to(torch.float32), c_d.to(torch.float32))
-                loss = loss / accumulation_steps
+                loss = 0
+                context_d = densities[:, 0] # Initial previous density
+                
+                # Noise Injection: Add noise to the initial context
+                if args and args.noise_std > 0:
+                    context_d = context_d + torch.randn_like(context_d) * args.noise_std
+
+                for step in range(ar_steps):
+                    # Inputs for this step
+                    p_v = velocities[:, step]
+                    c_d = densities[:, step + 1]
+                    c_v = velocities[:, step + 1]
+                    
+                    # Noise Injection for GT inputs
+                    if args and args.noise_std > 0:
+                        p_v = p_v + torch.randn_like(p_v) * args.noise_std
+                        c_d_in = c_d + torch.randn_like(c_d) * args.noise_std
+                        c_v_in = c_v + torch.randn_like(c_v) * args.noise_std
+                    else:
+                        c_d_in = c_d
+                        c_v_in = c_v
+
+                    output = model(context_d, p_v, c_d_in, c_v_in, mask)
+                    
+                    step_loss = criterion(output.to(torch.float32), c_d.to(torch.float32))
+                    loss += step_loss
+                    
+                    # Feedback for next step
+                    context_d = output.detach() if step < ar_steps - 1 else output
+                    
+                    # Optional: Add noise to context for next step to simulate drift
+                    if step < ar_steps - 1 and args and args.noise_std > 0:
+                        context_d = context_d + torch.randn_like(context_d) * args.noise_std
+
+                loss = loss / (accumulation_steps * ar_steps)
                 
             if scaler:
                 scaler.scale(loss).backward()
@@ -487,7 +534,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 
-            total_train_loss += (loss.item() * accumulation_steps)
+            total_train_loss += (loss.item() * accumulation_steps * ar_steps)
             total_train_var += torch.var(output).item()
             
             # Periodically Clear Fragments
@@ -512,19 +559,33 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         total_val_var = 0
         total_val_gt_var = 0
         with torch.no_grad():
-            for p_d, p_v, c_d, c_v, mask in val_loader:
-                p_d, p_v, c_d, c_v, mask = p_d.to(device), p_v.to(device), c_d.to(device), c_v.to(device), mask.to(device)
+            for densities, velocities, mask in val_loader:
+                densities, velocities, mask = densities.to(device), velocities.to(device), mask.to(device)
                 
                 if is_bf16:
-                   p_d, p_v, c_d, c_v, mask = p_d.to(torch.bfloat16), p_v.to(torch.bfloat16), c_d.to(torch.bfloat16), c_v.to(torch.bfloat16), mask.to(torch.bfloat16)
+                   densities, velocities, mask = densities.to(torch.bfloat16), velocities.to(torch.bfloat16), mask.to(torch.bfloat16)
                 
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16 if is_bf16 else torch.float16):
-                    output = model(p_d, p_v, c_d, c_v, mask)
-                    total_val_loss += criterion(output.float(), c_d.float()).item()
-                    total_val_zero += criterion(torch.zeros_like(c_d).float(), c_d.float()).item()
-                    total_val_ident += criterion(p_d.float(), c_d.float()).item()
-                    total_val_var += torch.var(output.float()).item()
-                    total_val_gt_var += torch.var(c_d.float()).item()
+                    context_d = densities[:, 0]
+                    batch_loss = 0
+                    for step in range(ar_steps):
+                        p_v = velocities[:, step]
+                        c_d = densities[:, step + 1]
+                        c_v = velocities[:, step + 1]
+                        
+                        output = model(context_d, p_v, c_d, c_v, mask)
+                        batch_loss += criterion(output.float(), c_d.float()).item()
+                        
+                        # Baselines (calculated for the last step usually, or averaged)
+                        if step == ar_steps - 1:
+                            total_val_zero += criterion(torch.zeros_like(c_d).float(), c_d.float()).item()
+                            total_val_ident += criterion(densities[:, step].float(), c_d.float()).item()
+                            total_val_var += torch.var(output.float()).item()
+                            total_val_gt_var += torch.var(c_d.float()).item()
+                        
+                        context_d = output
+                    
+                    total_val_loss += (batch_loss / ar_steps)
                 
                 torch.cuda.empty_cache()
 
@@ -568,6 +629,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=0, help="0 = Auto-detect maximum for GPU, >0 = fixed size")
     parser.add_argument("--effective_batch_size", type=int, default=8, help="Target batch size for optimization steps (achieved via accumulation)")
     parser.add_argument("--bf16", action="store_true", help="Use BFloat16 precision for memory savings")
+    parser.add_argument("--noise_std", type=float, default=0.0, help="Standard deviation of Gaussian noise to inject during training")
+    parser.add_argument("--ar_steps", type=int, default=1, help="Number of autoregressive steps to train for")
     args = parser.parse_args()
     train(args.epochs, args.data_dir, args.output_dir, args.model_name, args.fluid_weight, args.mass_loss_weight, args)
 
