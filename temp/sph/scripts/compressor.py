@@ -442,16 +442,16 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
     def hybrid_loss(input, target, f_weight=fluid_weight, m_weight=effective_mass_weight, grad_weight=15.0):
-        # Create mask for fluid vs background
+        # 1. Spatial Masks: Separate the fluid from the background
         fluid_mask = (target > 0.05).float()
         background_mask = 1.0 - fluid_mask
 
-        # Calculate MSE for both regions separately
-        mse_fluid = torch.sum(fluid_mask * (input - target) ** 2) / (fluid_mask.sum() + 1e-6)
-        mse_bg = torch.sum(background_mask * (input - target) ** 2) / (background_mask.sum() + 1e-6)
-        mse_total = (f_weight * mse_fluid) + mse_bg
+        # 2. Weighted MSE: Focus on getting the fluid reconstruction right
+        mse_f = torch.sum(fluid_mask * (input - target) ** 2) / (fluid_mask.sum() + 1e-6)
+        mse_b = torch.sum(background_mask * (input - target) ** 2) / (background_mask.sum() + 1e-6)
+        mse_total = (f_weight * mse_f) + mse_b
 
-        # Grad Consistency Term: Forces the model to match sharp edges
+        # 3. Gradient Consistency: Forces the model to match sharp edges (High-frequency details)
         in_dx = input[:, :, 1:, :] - input[:, :, :-1, :]
         in_dy = input[:, :, :, 1:] - input[:, :, :, :-1]
         tg_dx = target[:, :, 1:, :] - target[:, :, :-1, :]
@@ -459,19 +459,28 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         f_mask_dx = fluid_mask[:, :, 1:, :]
         f_mask_dy = fluid_mask[:, :, :, 1:]
         
-        grad_loss = (torch.sum(f_mask_dx * (in_dx - tg_dx)**2) / (f_mask_dx.sum() + 1e-6) +
-                     torch.sum(f_mask_dy * (in_dy - tg_dy)**2) / (f_mask_dy.sum() + 1e-6))
+        grad_l = (torch.sum(f_mask_dx * (in_dx - tg_dx)**2) / (f_mask_dx.sum() + 1e-6) +
+                  torch.sum(f_mask_dy * (in_dy - tg_dy)**2) / (f_mask_dy.sum() + 1e-6))
 
-        total_loss = mse_total + (grad_weight * grad_loss)
-
-        # Global Mass Conservation (Normalized to Mean to match MSE scale)
+        # 4. Global Mass Conservation: Ensures fluid doesn't disappear or appear from nowhere
+        mass_l = torch.tensor(0.0, device=input.device)
         if m_weight > 0:
             mass_input = torch.mean(input, dim=(1, 2, 3))
             mass_target = torch.mean(target, dim=(1, 2, 3))
-            mass_loss = torch.mean((mass_input - mass_target) ** 2)
-            total_loss += m_weight * mass_loss
+            mass_l = torch.mean((mass_input - mass_target) ** 2)
 
-        return total_loss
+        # 5. Total Weighted Loss
+        total_loss = mse_total + (grad_weight * grad_l) + (m_weight * mass_l)
+
+        # 6. Metrics Dictionary for human-readable logging
+        metrics = {
+            "mse_fluid": mse_f.item(),
+            "mse_bg": mse_b.item(),
+            "grad": grad_l.item(),
+            "mass": mass_l.item()
+        }
+
+        return total_loss, metrics
 
     criterion = hybrid_loss
     
@@ -484,7 +493,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     # Prepare loss logging
     log_file = os.path.join(run_dir, "losses.csv")
     with open(log_file, "w") as f:
-        f.write("epoch,train_loss,val_loss,val_zero,val_ident,train_var,val_var\n")
+        f.write("epoch,train_loss,val_loss,mse_f,mse_b,grad,mass\n")
 
     best_val_loss = float('inf')
     epochs = requested_epochs if requested_epochs else 50
@@ -492,7 +501,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         # --- TRAINING LOOP ---
         model.train()
         total_train_loss = 0
-        total_train_var = 0
+        epoch_metrics = {"mse_fluid": 0, "mse_bg": 0, "grad": 0, "mass": 0}
         optimizer.zero_grad(set_to_none=True)
         
         for i, (densities, velocities, mask) in enumerate(train_loader):
@@ -542,8 +551,10 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
 
                     output = model(context_d, p_v, c_d_in, c_v_in, mask)
                     
-                    step_loss = criterion(output.to(torch.float32), c_d.to(torch.float32))
+                    step_loss, step_metrics = criterion(output.to(torch.float32), c_d.to(torch.float32))
                     loss += step_loss
+                    for k in epoch_metrics:
+                        epoch_metrics[k] += step_metrics[k]
                     
                     # Feedback for next step (Full BPTT: No detaching)
                     context_d = output
@@ -571,7 +582,6 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
                 optimizer.zero_grad(set_to_none=True)
                 
             total_train_loss += (loss.item() * accumulation_steps * ar_steps)
-            total_train_var += torch.var(output).item()
             
             # Periodically Clear Fragments
             if (i + 1) % 50 == 0:
@@ -593,10 +603,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         # --- VALIDATION LOOP ---
         model.eval()
         total_val_loss = 0
-        total_val_zero = 0
-        total_val_ident = 0
-        total_val_var = 0
-        total_val_gt_var = 0
+        val_metrics = {"mse_fluid": 0, "mse_bg": 0, "grad": 0, "mass": 0}
         with torch.no_grad():
             for densities, velocities, mask in val_loader:
                 densities, velocities, mask = densities.to(device), velocities.to(device), mask.to(device)
@@ -613,14 +620,10 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
                         c_v = velocities[:, step + 1]
                         
                         output = model(context_d, p_v, c_d, c_v, mask)
-                        batch_loss += criterion(output.float(), c_d.float()).item()
-                        
-                        # Baselines (calculated for the last step usually, or averaged)
-                        if step == ar_steps - 1:
-                            total_val_zero += criterion(torch.zeros_like(c_d).float(), c_d.float()).item()
-                            total_val_ident += criterion(densities[:, step].float(), c_d.float()).item()
-                            total_val_var += torch.var(output.float()).item()
-                            total_val_gt_var += torch.var(c_d.float()).item()
+                        step_loss, step_metrics = criterion(output.float(), c_d.float())
+                        batch_loss += step_loss.item()
+                        for k in val_metrics:
+                            val_metrics[k] += step_metrics[k]
                         
                         context_d = output
                     
@@ -628,27 +631,23 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
                 
                 torch.cuda.empty_cache()
 
-        # Reports normalized MSE
         avg_train_loss = total_train_loss / len(train_loader)
         avg_val_loss = total_val_loss / len(val_loader)
-        avg_val_zero = total_val_zero / len(val_loader)
-        avg_val_ident = total_val_ident / len(val_loader)
-        avg_train_var = total_train_var / len(train_loader)
-        avg_val_var = total_val_var / len(val_loader)
-        avg_val_gt_var = total_val_gt_var / len(val_loader)
         
+        # Calculate metric averages
+        for k in epoch_metrics: epoch_metrics[k] /= (len(train_loader) * ar_steps)
+        for k in val_metrics: val_metrics[k] /= (len(val_loader) * ar_steps)
+
         # Step the scheduler
         scheduler.step(avg_val_loss)
         
         print(f"Epoch {epoch+1}/{epochs}")
         print(f"    Train Loss: {avg_train_loss:.8f} | Val Loss: {avg_val_loss:.8f}")
-        print(f"    Val Baselines: [Zero: {avg_val_zero:.8f}, Ident: {avg_val_ident:.8f}]")
-        print(f"    Variance: [Train: {avg_train_var:.8f}, Val: {avg_val_var:.8f}, Val_GT: {avg_val_gt_var:.8f}]")
-        print(f"    Val Max: [Pred: {output.max().item():.4f}, GT: {c_d.max().item():.4f}]")
+        print(f"    Metrics (Val): [Fluid_MSE: {val_metrics['mse_fluid']:.6f}, BG_MSE: {val_metrics['mse_bg']:.6f}, Grad: {val_metrics['grad']:.6f}, Mass: {val_metrics['mass']:.6f}]")
         
         # Log to CSV
         with open(log_file, "a") as f:
-            f.write(f"{epoch+1},{avg_train_loss:.8f},{avg_val_loss:.8f},{avg_val_zero:.8f},{avg_val_ident:.8f},{avg_train_var:.8f},{avg_val_var:.8f}\n")
+            f.write(f"{epoch+1},{avg_train_loss:.8f},{avg_val_loss:.8f},{val_metrics['mse_fluid']:.8f},{val_metrics['mse_bg']:.8f},{val_metrics['grad']:.8f},{val_metrics['mass']:.8f}\n")
 
         # Save Best Model logic
         if avg_val_loss < best_val_loss:

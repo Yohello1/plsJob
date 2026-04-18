@@ -13,17 +13,20 @@ module load cuda/12.4
 
 source env/bin/activate
 # --- Configuration ---
-ITERATIONS=20         # Total cycles
+ITERATIONS=10         # Total cycles
 RUNS_PER_ITERATION=10 # Parallel simulations per cycle
 MAX_SESSIONS=30       # Keep last N folders per run
-EPOCHS_PER_CLEAN=7    # Training epochs per cycle
+EPOCHS_PER_CLEAN=3    # Training epochs per cycle
 FRAMES_PER_RUN=200    # Frames per simulation
-MASS_LOSS_START_CYCLE=5
-MASS_LOSS_WEIGHT=2.0
+MASS_LOSS_START_CYCLE=2
+MASS_LOSS_WEIGHT=2.5
+FLUID_LOSS_WEIGHT=15.0 # FIXED: Scaled up for 400x400 sparsity (5.0 was too low)
 NOISE_STD=0.005        # Small noise to improve stability
 AR_STEPS=4             # TARGET maximum number of autoregressive steps
 AR_START_CYCLE=1       # Cycle to begin curriculum
 AR_INCREMENT_INTERVAL=3 # How many cycles to wait between increasing AR steps
+
+
 
 # --- Unique Run Setup ---
 # Use first argument as RUN_NAME if provided, otherwise generate a unique one
@@ -78,6 +81,7 @@ for i in $(seq 1 $ITERATIONS); do
         --model_name "best_model.pth" \
         --mass_loss_weight $MASS_LOSS_WEIGHT \
         --mass_loss_start_cycle $MASS_LOSS_START_CYCLE \
+        --fluid_weight $FLUID_LOSS_WEIGHT \
         --batch_size 0 \
         --effective_batch_size 8 \
         --noise_std $NOISE_STD \
