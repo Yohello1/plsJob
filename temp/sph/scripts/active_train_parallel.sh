@@ -21,7 +21,9 @@ FRAMES_PER_RUN=200    # Frames per simulation
 MASS_LOSS_START_CYCLE=5
 MASS_LOSS_WEIGHT=2.0
 NOISE_STD=0.005        # Small noise to improve stability
-AR_STEPS=1             # Number of autoregressive steps (start with 1, increase to 2-4 later)
+AR_STEPS=4             # TARGET maximum number of autoregressive steps
+AR_START_CYCLE=1       # Cycle to begin curriculum
+AR_INCREMENT_INTERVAL=3 # How many cycles to wait between increasing AR steps
 
 # --- Unique Run Setup ---
 # Use first argument as RUN_NAME if provided, otherwise generate a unique one
@@ -80,6 +82,8 @@ for i in $(seq 1 $ITERATIONS); do
         --effective_batch_size 8 \
         --noise_std $NOISE_STD \
         --ar_steps $AR_STEPS \
+        --ar_start_cycle $AR_START_CYCLE \
+        --ar_increment_interval $AR_INCREMENT_INTERVAL \
         --bf16
     
     echo "Cycle $i complete."

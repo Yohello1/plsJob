@@ -266,18 +266,19 @@ def find_max_batch_size(model, device, is_bf16=False, ar_steps=1):
     for b in candidates:
         try:
             with torch.amp.autocast('cuda', dtype=torch.bfloat16 if is_bf16 else torch.float16):
-                # Simulate AR steps to check memory limit
+                # Simulate AR steps to check memory limit (BPTT style)
                 context_d = p_d.expand(b, -1, -1, -1)
+                total_loss = 0
                 for _ in range(ar_steps):
-                    # Mock forward pass logic
                     out = model(context_d, 
                                 p_v.expand(b, -1, -1, -1),
                                 c_d.expand(b, -1, -1, -1),
                                 c_v.expand(b, -1, -1, -1),
                                 mask.expand(b, -1, -1, -1))
-                    context_d = out # Predictor loop
-                    loss = out.sum()
-                    loss.backward(retain_graph=True) # Retain graph if multi-step backprop
+                    context_d = out 
+                    total_loss += out.sum()
+                
+                total_loss.backward()
             
             model.zero_grad(set_to_none=True)
             found_batch = b
@@ -299,10 +300,25 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     start_cycle = args.mass_loss_start_cycle if args and hasattr(args, 'mass_loss_start_cycle') else 1
     
     effective_mass_weight = mass_loss_weight if current_cycle >= start_cycle else 0.0
+    
+    # AR Curriculum Logic
+    ar_target_steps = args.ar_steps if args and hasattr(args, 'ar_steps') else 1
+    ar_start_cycle = args.ar_start_cycle if args and hasattr(args, 'ar_start_cycle') else 1
+    ar_interval = args.ar_increment_interval if args and hasattr(args, 'ar_increment_interval') else 3
+    
+    if current_cycle < ar_start_cycle:
+        effective_ar_steps = 1
+    else:
+        # Increment every N cycles: 1 + (cycles_since_start // interval)
+        effective_ar_steps = 1 + (current_cycle - ar_start_cycle) // ar_interval
+        effective_ar_steps = min(effective_ar_steps, ar_target_steps)
+
     if effective_mass_weight != mass_loss_weight:
         print(f"Curriculum: Mass loss weight delayed (current cycle {current_cycle} < start cycle {start_cycle}) | Effective Weight: {effective_mass_weight}")
     else:
         print(f"Curriculum: Mass loss weight active (Cycle {current_cycle} >= {start_cycle}) | Effective Weight: {effective_mass_weight}")
+        
+    print(f"Curriculum: AR steps (Cycle {current_cycle}) | Effective Steps: {effective_ar_steps} (Target: {ar_target_steps})")
 
     num_gpus = torch.cuda.device_count()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -339,7 +355,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     val_dirs = session_dirs[split_idx:]
     print(f"Dataset split: {len(train_dirs)} training sessions, {len(val_dirs)} validation sessions.")
 
-    ar_steps = args.ar_steps if args and hasattr(args, 'ar_steps') else 1
+    ar_steps = effective_ar_steps # Use curriculum-determined steps
     train_dataset = SPHDataset(train_dirs, n_steps=ar_steps)
     val_dataset = SPHDataset(val_dirs, n_steps=ar_steps)
     skip_val = train_dataset.skip
@@ -470,6 +486,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     with open(log_file, "w") as f:
         f.write("epoch,train_loss,val_loss,val_zero,val_ident,train_var,val_var\n")
 
+    best_val_loss = float('inf')
     epochs = requested_epochs if requested_epochs else 50
     for epoch in range(epochs):
         # --- TRAINING LOOP ---
@@ -480,6 +497,22 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         
         for i, (densities, velocities, mask) in enumerate(train_loader):
             densities, velocities, mask = densities.to(device), velocities.to(device), mask.to(device)
+            
+            # --- Physical Symmetry Augmentation (Flips) ---
+            # Horizontal Flip
+            if random.random() > 0.5:
+                densities = torch.flip(densities, [-1])
+                velocities = torch.flip(velocities, [-1])
+                # Flip X-velocity component (index 0)
+                velocities[:, :, 0] *= -1
+                mask = torch.flip(mask, [-1])
+            # Vertical Flip
+            if random.random() > 0.5:
+                densities = torch.flip(densities, [-2])
+                velocities = torch.flip(velocities, [-2])
+                # Flip Y-velocity component (index 1)
+                velocities[:, :, 1] *= -1
+                mask = torch.flip(mask, [-2])
             
             if is_bf16 and torch.cuda.is_bf16_supported():
                 densities, velocities, mask = densities.to(torch.bfloat16), velocities.to(torch.bfloat16), mask.to(torch.bfloat16)
@@ -512,8 +545,8 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
                     step_loss = criterion(output.to(torch.float32), c_d.to(torch.float32))
                     loss += step_loss
                     
-                    # Feedback for next step
-                    context_d = output.detach() if step < ar_steps - 1 else output
+                    # Feedback for next step (Full BPTT: No detaching)
+                    context_d = output
                     
                     # Optional: Add noise to context for next step to simulate drift
                     if step < ar_steps - 1 and args and args.noise_std > 0:
@@ -528,9 +561,12 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
             
             if (i + 1) % accumulation_steps == 0:
                 if scaler:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 
@@ -545,9 +581,12 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         # Handle leftover gradients if dataset size not divisible
         if (len(train_loader) % accumulation_steps) != 0:
             if scaler:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
             else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
         
@@ -610,10 +649,16 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         # Log to CSV
         with open(log_file, "a") as f:
             f.write(f"{epoch+1},{avg_train_loss:.8f},{avg_val_loss:.8f},{avg_val_zero:.8f},{avg_val_ident:.8f},{avg_train_var:.8f},{avg_val_var:.8f}\n")
-            
-        torch.save(model.state_dict(), os.path.join(run_dir, "best_model.pth"))
-        # Also keep a copy in output_dir (run-collection root) for current state
-        torch.save(model.state_dict(), os.path.join(output_dir, model_filename))
+
+        # Save Best Model logic
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            print(f"    *** New Best Val Loss: {best_val_loss:.8f} (Saved) ***")
+            torch.save(model.state_dict(), os.path.join(run_dir, "best_model.pth"))
+            # Also keep a copy in output_dir (run-collection root) for current state
+            torch.save(model.state_dict(), os.path.join(output_dir, model_filename))
+        else:
+            print(f"    (Best Val Loss remained: {best_val_loss:.8f})")
 
 if __name__ == "__main__":
     import argparse
@@ -623,14 +668,16 @@ if __name__ == "__main__":
     parser.add_argument("--data_dir", type=str, default="data")
     parser.add_argument("--output_dir", type=str, default="attempts")
     parser.add_argument("--model_name", type=str, default="best_model.pth")
-    parser.add_argument("--fluid_weight", type=float, default=25.0)
+    parser.add_argument("--fluid_weight", type=float, default=12.0)
     parser.add_argument("--mass_loss_weight", type=float, default=0.0)
     parser.add_argument("--mass_loss_start_cycle", type=int, default=5, help="At what cycle to begin applying mass loss weight")
     parser.add_argument("--batch_size", type=int, default=0, help="0 = Auto-detect maximum for GPU, >0 = fixed size")
     parser.add_argument("--effective_batch_size", type=int, default=8, help="Target batch size for optimization steps (achieved via accumulation)")
     parser.add_argument("--bf16", action="store_true", help="Use BFloat16 precision for memory savings")
     parser.add_argument("--noise_std", type=float, default=0.0, help="Standard deviation of Gaussian noise to inject during training")
-    parser.add_argument("--ar_steps", type=int, default=1, help="Number of autoregressive steps to train for")
+    parser.add_argument("--ar_steps", type=int, default=1, help="Target number of autoregressive steps to train for (maximum)")
+    parser.add_argument("--ar_start_cycle", type=int, default=1, help="Cycle at which to start increasing AR steps")
+    parser.add_argument("--ar_increment_interval", type=int, default=3, help="How many cycles to wait between increasing AR steps")
     args = parser.parse_args()
     train(args.epochs, args.data_dir, args.output_dir, args.model_name, args.fluid_weight, args.mass_loss_weight, args)
 
