@@ -70,6 +70,7 @@ class SPHDataset(Dataset):
         self.field_size = BUFFER_WIDTH * BUFFER_HEIGHT * 4
         self.order = {"d": 0, "v_x": 1, "v_y": 2, "m": 3}
         self.handles = {} # Local handle cache to avoid NFS re-opening
+        self.skip_val = False
 
         for d_dir in self.data_dirs:
             bin_file = os.path.join(d_dir, "sim_data.bin")
@@ -79,10 +80,13 @@ class SPHDataset(Dataset):
             file_size = os.path.getsize(bin_file)
             num_frames = file_size // self.frame_size
             
-            for i in range(num_frames - self.skip * self.n_steps):
-                # Store (directory, start_idx)
-                # We can calculate all subsequent indices using start_idx + k*skip
+            # Ensure we have enough frames for the AR rollout
+            max_start = num_frames - (self.n_steps * self.skip)
+            for i in range(max_start):
                 self.samples.append((d_dir, i))
+        
+        if not self.samples:
+            self.skip_val = True
 
     def _get_handle(self, data_dir):
         if data_dir not in self.handles:
@@ -441,7 +445,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     # optimizer = optim.Adam(model.parameters(), lr=LR, eps=1e-4) 
     
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
-    def hybrid_loss(input, target, f_weight=fluid_weight, m_weight=effective_mass_weight, grad_weight=15.0):
+    def hybrid_loss(input, target, f_weight=fluid_weight, m_weight=effective_mass_weight, grad_weight=15.0, prev_frame=None):
         # 1. Spatial Masks: Separate the fluid from the background
         fluid_mask = (target > 0.05).float()
         background_mask = 1.0 - fluid_mask
@@ -469,15 +473,22 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
             mass_target = torch.mean(target, dim=(1, 2, 3))
             mass_l = torch.mean((mass_input - mass_target) ** 2)
 
-        # 5. Total Weighted Loss
+        # 5. Baselines (For human readability)
+        with torch.no_grad():
+            zero_l = F.mse_loss(torch.zeros_like(target), target).item()
+            ident_l = F.mse_loss(prev_frame, target).item() if prev_frame is not None else 0.0
+
+        # 6. Total Weighted Loss
         total_loss = mse_total + (grad_weight * grad_l) + (m_weight * mass_l)
 
-        # 6. Metrics Dictionary for human-readable logging
+        # 7. Metrics Dictionary for human-readable logging
         metrics = {
             "mse_fluid": mse_f.item(),
             "mse_bg": mse_b.item(),
             "grad": grad_l.item(),
-            "mass": mass_l.item()
+            "mass": mass_l.item(),
+            "zero": zero_l,
+            "ident": ident_l
         }
 
         return total_loss, metrics
@@ -501,7 +512,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         # --- TRAINING LOOP ---
         model.train()
         total_train_loss = 0
-        epoch_metrics = {"mse_fluid": 0, "mse_bg": 0, "grad": 0, "mass": 0}
+        epoch_metrics = {"mse_fluid": 0, "mse_bg": 0, "grad": 0, "mass": 0, "zero": 0, "ident": 0}
         optimizer.zero_grad(set_to_none=True)
         
         for i, (densities, velocities, mask) in enumerate(train_loader):
@@ -551,7 +562,8 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
 
                     output = model(context_d, p_v, c_d_in, c_v_in, mask)
                     
-                    step_loss, step_metrics = criterion(output.to(torch.float32), c_d.to(torch.float32))
+                    # Pass previous frame (densities[:, step]) for Identity baseline calculation
+                    step_loss, step_metrics = criterion(output.to(torch.float32), c_d.to(torch.float32), prev_frame=densities[:, step])
                     loss += step_loss
                     for k in epoch_metrics:
                         epoch_metrics[k] += step_metrics[k]
@@ -603,7 +615,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         # --- VALIDATION LOOP ---
         model.eval()
         total_val_loss = 0
-        val_metrics = {"mse_fluid": 0, "mse_bg": 0, "grad": 0, "mass": 0}
+        val_metrics = {"mse_fluid": 0, "mse_bg": 0, "grad": 0, "mass": 0, "zero": 0, "ident": 0}
         with torch.no_grad():
             for densities, velocities, mask in val_loader:
                 densities, velocities, mask = densities.to(device), velocities.to(device), mask.to(device)
@@ -620,7 +632,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
                         c_v = velocities[:, step + 1]
                         
                         output = model(context_d, p_v, c_d, c_v, mask)
-                        step_loss, step_metrics = criterion(output.float(), c_d.float())
+                        step_loss, step_metrics = criterion(output.float(), c_d.float(), prev_frame=densities[:, step])
                         batch_loss += step_loss.item()
                         for k in val_metrics:
                             val_metrics[k] += step_metrics[k]
@@ -634,7 +646,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         avg_train_loss = total_train_loss / len(train_loader)
         avg_val_loss = total_val_loss / len(val_loader)
         
-        # Calculate metric averages
+        # Calculate metric averages (normalized by number of batches and AR steps)
         for k in epoch_metrics: epoch_metrics[k] /= (len(train_loader) * ar_steps)
         for k in val_metrics: val_metrics[k] /= (len(val_loader) * ar_steps)
 
@@ -644,10 +656,11 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         print(f"Epoch {epoch+1}/{epochs}")
         print(f"    Train Loss: {avg_train_loss:.8f} | Val Loss: {avg_val_loss:.8f}")
         print(f"    Metrics (Val): [Fluid_MSE: {val_metrics['mse_fluid']:.6f}, BG_MSE: {val_metrics['mse_bg']:.6f}, Grad: {val_metrics['grad']:.6f}, Mass: {val_metrics['mass']:.6f}]")
+        print(f"    Baselines (Val): [Zero: {val_metrics['zero']:.6f}, Ident: {val_metrics['ident']:.6f}]")
         
         # Log to CSV
         with open(log_file, "a") as f:
-            f.write(f"{epoch+1},{avg_train_loss:.8f},{avg_val_loss:.8f},{val_metrics['mse_fluid']:.8f},{val_metrics['mse_bg']:.8f},{val_metrics['grad']:.8f},{val_metrics['mass']:.8f}\n")
+            f.write(f"{epoch+1},{avg_train_loss:.8f},{avg_val_loss:.8f},{val_metrics['mse_fluid']:.8f},{val_metrics['mse_bg']:.8f},{val_metrics['grad']:.8f},{val_metrics['mass']:.8f},{val_metrics['zero']:.8f},{val_metrics['ident']:.8f}\n")
 
         # Save Best Model logic
         if avg_val_loss < best_val_loss:
