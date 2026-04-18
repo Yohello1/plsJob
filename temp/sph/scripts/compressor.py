@@ -435,8 +435,8 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     
     print(f"Batch Size: {batch_size} | Effective Batch: {effective_batch} (Accumulation Steps: {accumulation_steps})")
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=8, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True)
     
     if num_gpus > 1:
         model = nn.DataParallel(model)
