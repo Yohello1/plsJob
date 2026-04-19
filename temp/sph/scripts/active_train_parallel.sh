@@ -20,11 +20,11 @@ EPOCHS_PER_CLEAN=3    # Training epochs per cycle
 FRAMES_PER_RUN=200    # Frames per simulation
 MASS_LOSS_START_CYCLE=2
 MASS_LOSS_WEIGHT=2.5
-FLUID_LOSS_WEIGHT=15.0 # FIXED: Scaled up for 400x400 sparsity (5.0 was too low)
-NOISE_STD=0.005        # Small noise to improve stability
-AR_STEPS=4             # TARGET maximum number of autoregressive steps
-AR_START_CYCLE=1       # Cycle to begin curriculum
-AR_INCREMENT_INTERVAL=3 # How many cycles to wait between increasing AR steps
+FLUID_LOSS_WEIGHT=35.0 # Increased to combat Zero-baseline drift
+NOISE_STD=0.01        # Increased to improve error-correction robustness
+AR_STEPS=5            # TARGET maximum number of autoregressive steps
+AR_START_CYCLE=2       # Cycle to begin curriculum
+AR_INCREMENT_INTERVAL=3 # Give model 3 cycles to adapt to step increases
 
 
 
