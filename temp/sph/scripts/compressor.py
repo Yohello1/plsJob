@@ -30,13 +30,13 @@ ACTIVATION_LOOKUP = {
 }
 ACT = ACTIVATION_LOOKUP[ACTIVATION_TYPE]
 
-def get_coord_grid(batch_size, h, w, device):
+def get_coord_grid(h, w, device):
     """Generates X and Y coordinate channels ranging from -1 to 1."""
     yy = torch.linspace(-1, 1, h, device=device)
     xx = torch.linspace(-1, 1, w, device=device)
     grid_y, grid_x = torch.meshgrid(yy, xx, indexing='ij')
     grid = torch.stack([grid_x, grid_y], dim=0) # [2, H, W]
-    return grid.unsqueeze(0).repeat(batch_size, 1, 1, 1)
+    return grid.unsqueeze(0) # [1, 2, H, W]
 
 class ResBlock(nn.Module):
     """Residual block to help deeper networks learn more effectively."""
@@ -215,13 +215,17 @@ class Decoder(nn.Module):
         # 1. Map bottleneck to 50x50
         x = self.fc(z).view(-1, 128, 50, 50)
         
-        # 2. Extract Context "Blueprints" from Previous Frame + Mask + Coords
-        ctx_400 = self.context_400(torch.cat([prev_d, mask, coords], dim=1))
+        # 2. Expand static coords to match batch size
+        b = z.size(0)
+        batch_coords = coords.expand(b, -1, -1, -1)
+        
+        # 3. Extract Context "Blueprints" from Previous Frame + Mask + Coords
+        ctx_400 = self.context_400(torch.cat([prev_d, mask, batch_coords], dim=1))
         ctx_200 = self.context_200(ctx_400)
         ctx_100 = self.context_100(ctx_200)
         ctx_50  = self.context_50(ctx_100)
         
-        # 3. Upsample while injecting high-res context at each step
+        # 4. Upsample while injecting high-res context at each step
         x = self.up_50_to_100(torch.cat([x, ctx_50], dim=1))
         x = self.up_100_to_200(torch.cat([x, ctx_100], dim=1))
         # Inject the 200x200 details right before the final 400x400 expansion
@@ -234,8 +238,15 @@ class FullModel(nn.Module):
         super().__init__()
         self.encoder = Encoder(latent_dim)
         self.decoder = Decoder(latent_dim)
+        # Register coordinate grid as a buffer (it's constant, no need to regenerate)
+        self.register_buffer("coord_grid", get_coord_grid(BUFFER_HEIGHT, BUFFER_WIDTH, "cpu"))
+
     def forward(self, p_d, p_v, c_d, c_v, mask):
-        coords = get_coord_grid(p_d.size(0), BUFFER_HEIGHT, BUFFER_WIDTH, p_d.device).to(p_d.dtype)
+        # p_d: [B, 1, H, W], p_v: [B, 2, H, W], etc.
+        b = p_d.size(0)
+        # Expand coordinate grid to match batch size without copying memory
+        coords = self.coord_grid.expand(b, -1, -1, -1)
+        
         # 9 channels: p_d(1), p_v(2), c_d(1), c_v(2), mask(1), coords(2)
         z = self.encoder(torch.cat([p_d, p_v, c_d, c_v, mask, coords], dim=1))
         return self.decoder(z, p_d, mask, coords)
@@ -248,30 +259,37 @@ class FullModel(nn.Module):
         return count
 
 def find_max_batch_size(model, device, is_bf16=False, ar_steps=1):
-    """Auto-detects the largest power-of-2 (or multiple) batch size that fits in VRAM."""
-    print("Auto-detecting maximum possible batch size...")
+    """Auto-detects the largest batch size with a safety margin and realistic loss overhead."""
+    print(f"Auto-detecting maximum possible batch size for {ar_steps} AR steps...")
     torch.cuda.empty_cache()
     gc.collect()
     
-    # Mock inputs matching FullModel.forward(p_d, p_v, c_d, c_v, mask)
-    p_d = torch.randn(1, 1, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
-    p_v = torch.randn(1, 2, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
-    c_d = torch.randn(1, 1, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
-    c_v = torch.randn(1, 2, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
-    mask = torch.randn(1, 1, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
+    # Mock inputs matching FullModel sequence data
+    # We use actual tensors (not just expanded ones) to simulate the real sequence memory
+    # But for detection speed, we expand just for the forward pass
+    p_d = torch.zeros(1, 1, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
+    p_v = torch.zeros(1, 2, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
+    c_d = torch.zeros(1, 1, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
+    c_v = torch.zeros(1, 2, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
+    mask = torch.zeros(1, 1, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
     
     if is_bf16:
         p_d, p_v, c_d, c_v, mask = [t.to(torch.bfloat16) for t in [p_d, p_v, c_d, c_v, mask]]
 
+    # Mock Optimizer to account for moment memory
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+
     model.train()
     found_batch = 1
-    # Try common tensor-core friendly batch sizes
-    candidates = [1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128]
+    # Try common tensor-core friendly batch sizes. Capped at 128 for stability.
+    candidates = [1, 2, 4, 8, 16, 32, 48, 64, 80, 96, 112, 128]
     
     for b in candidates:
         try:
+            # We clear memory carefully before each probe
+            torch.cuda.empty_cache()
+            
             with torch.amp.autocast('cuda', dtype=torch.bfloat16 if is_bf16 else torch.float16):
-                # Simulate AR steps to check memory limit (BPTT style)
                 context_d = p_d.expand(b, -1, -1, -1)
                 total_loss = 0
                 for _ in range(ar_steps):
@@ -280,24 +298,40 @@ def find_max_batch_size(model, device, is_bf16=False, ar_steps=1):
                                 c_d.expand(b, -1, -1, -1),
                                 c_v.expand(b, -1, -1, -1),
                                 mask.expand(b, -1, -1, -1))
+                    
+                    # More realistic loss overhead: spatial operations + masks
+                    fluid_mask = (out > 0.05).float()
+                    mse = torch.sum(fluid_mask * (out - c_d.expand(b, -1, -1, -1))**2)
+                    total_loss += mse
                     context_d = out 
-                    total_loss += out.sum()
                 
                 total_loss.backward()
+                optimizer.step()
             
             model.zero_grad(set_to_none=True)
+            optimizer.zero_grad(set_to_none=True)
             found_batch = b
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
+                print(f"    Batch {b} failed: Out of Memory")
                 torch.cuda.empty_cache()
                 break
             else:
                 raise e
     
-    print(f"Max batch size found: {found_batch}")
+    # Apply a Safety Margin (85%) to account for Data Loader and Fragmentation
+    safe_batch = max(1, int(found_batch * 0.85))
+    # Round down to nearest multiple of 4 if > 4 for tensor core alignment
+    if safe_batch > 4:
+        safe_batch = (safe_batch // 4) * 4
+
+    print(f"Max batch detected: {found_batch} | Safe training batch: {safe_batch}")
+    
+    # Cleanup detection garbage
+    del optimizer
     torch.cuda.empty_cache()
     gc.collect()
-    return found_batch
+    return safe_batch
 
 def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_filename="best_model.pth", fluid_weight=50.0, mass_loss_weight=0.0, args=None):
     # Determine effective mass loss weight based on curriculum
