@@ -10,6 +10,7 @@
 #include "math.hpp"
 #include "spiky_k.hpp"
 #include "logging.hpp"
+#include "sycl.hpp" 
 #ifdef USE_SDL
 #include <SDL2/SDL.h>
 #endif
@@ -21,6 +22,9 @@
 #include <iomanip>
 #include <random>
 #include <filesystem>
+#include <chrono>
+#include <chrono>
+
 
 void simulateFloaters()
 {
@@ -31,26 +35,32 @@ void simulateFloaters()
         JD::floaters::BLOCK_NEIGHBOR_COUNT,
         JD::floaters::blocks,
         JD::floaters::floatersA,
-        PARTICLE_SIZE);
+        PARTICLE_SIZE,
+        JD::sycl::compute_queue);
     JD::simulate::computePressureForce<JD::Spiky_k::gradient>(
         JD::graphics::offsets,
         JD::graphics::cells_ctr,
         JD::graphics::particles_loc,
+        JD::floaters::blocks,
         JD::floaters::floatersA,
-        PARTICLE_SIZE);
+        PARTICLE_SIZE,
+        JD::sycl::compute_queue);
     JD::simulate::computeViscosity<JD::Viscosity_k::laplacian>(
         JD::graphics::offsets,
         JD::graphics::cells_ctr,
         JD::graphics::particles_loc,
+        JD::floaters::blocks,
         JD::floaters::floatersA,
-        PARTICLE_SIZE);
+        PARTICLE_SIZE,
+        JD::sycl::compute_queue);
     JD::simulate::applyYAccelerationToAllParticles<JD::gravity::gravityAcceleration>(
         JD::floaters::floatersA);
     JD::simulate::integrate(
         JD::graphics::offsets,
         JD::graphics::cells_ctr,
         JD::graphics::particles_loc,
-        JD::floaters::floatersA);
+        JD::floaters::floatersA,
+        JD::sycl::compute_queue);
 }
 
 
@@ -128,7 +138,7 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        JD::graphics::InitializeStaticBuffer();
+        JD::graphics::initBuffers();
 
         window = SDL_CreateWindow(
             "Viewport Render",
@@ -162,7 +172,7 @@ int main(int argc, char** argv) {
     clock_t start, end;
 
     while (!quit) {
-        start = clock();
+        auto t_frame_start = std::chrono::high_resolution_clock::now();
 
 #ifdef USE_SDL
         if (!headless) {
@@ -189,8 +199,10 @@ int main(int argc, char** argv) {
         }
 #endif
 
+        auto t_grid_start = std::chrono::high_resolution_clock::now();
         JD::spatial::offsetsCreation();
         JD::spatial::computeIndicies();
+        auto t_grid_end = std::chrono::high_resolution_clock::now();
 
 #ifdef USE_SDL
         if (!headless) {
@@ -199,21 +211,21 @@ int main(int argc, char** argv) {
         }
 #endif
 
+        auto t_sim_start = std::chrono::high_resolution_clock::now();
         simulateFloaters();
+        auto t_sim_end = std::chrono::high_resolution_clock::now();
 
         static int frame_num = 0;
-        if (max_frames > 0 && frame_num >= max_frames) quit = true;
-
-        if (frame_num % 1 == 0) { 
-           JD::logging::log(frame_num);
-        }
-        
         frame_num++;
 
-        end = clock();
-        double time_taken = double(end - start) / double(CLOCKS_PER_SEC);
+        std::chrono::duration<double, std::milli> ms_grid = t_grid_end - t_grid_start;
+        std::chrono::duration<double, std::milli> ms_sim = t_sim_end - t_sim_start;
+        std::chrono::duration<double, std::milli> ms_total = std::chrono::high_resolution_clock::now() - t_frame_start;
+
         std::cout << "Frame " << (frame_num-1)
-                  << " Time: " << std::fixed << std::setprecision(4) << time_taken << "s" << std::endl;
+                  << " | Grid: " << std::fixed << std::setprecision(3) << ms_grid.count() << "ms"
+                  << " | Sim: " << ms_sim.count() << "ms"
+                  << " | Total: " << ms_total.count() << "ms" << std::endl;
     
         std::string frame_name = base + "/frames/";
         frame_name += std::to_string(frame_num);

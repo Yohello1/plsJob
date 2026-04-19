@@ -60,6 +60,50 @@ Performance analyzer.
 -   **`env/`**: Your local virtual environment (recommended).
 
 ## 📂 Output Structure
-1.  **`data/run_.../`**: Stores raw `.bin` data from each simulation.
+1.  **`data/run_.../`**: Stores raw binary simulation data.
 2.  **`logs/run_.../`**: Stores individual simulation logs and slurm outputs.
 3.  **`attempts/run_.../`**: Stores model checkpoints (`best_model.pth`), loss curves (`losses.csv`), and training settings.
+
+---
+
+## 📊 Data Analysis
+
+### 📈 Reading Losses (`losses.csv`)
+The `losses.csv` file is updated every epoch. You can monitor it using `tail -f` or plot it with `matplotlib`.
+- **`train_loss` / `val_loss`**: The total weighted loss (Hybrid Loss).
+- **`mse_f`**: Mean Squared Error on **fluid pixels only**. This is your main quality metric.
+- **`mse_b`**: MSE on the background. Should stay very low.
+- **`grad`**: Gradient consistency loss (edge sharpness).
+- **`mass`**: Physics violation penalty (fluid disappearance/creation).
+- **`zero`**: Baseline MSE if the model simply predicted nothing.
+- **`ident`**: Baseline MSE if the model simply copied the previous frame.
+> [!TIP]
+> **Success Criteria**: `mse_f` must be significantly lower than `zero` and `ident`. If `mse_f` approaches `zero`, the model is collapsing/blurring.
+
+### 💾 Reading Raw Simulation Data (`sim_data.bin`)
+Simulation data is stored in a flat binary format for maximum IOPS. Each frame consists of **4 contiguous float32 fields** of size **400x400**.
+
+**Field Order**:
+1.  **Density** (`[0, 1]`)
+2.  **Velocity X**
+3.  **Velocity Y**
+4.  **Fluid Mask** (0 or 1)
+
+**Python Reading Example**:
+```python
+import numpy as np
+
+# Dimensions
+W, H = 400, 400
+frame_size = 4 * W * H * 4 # 4 fields * 400 * 400 * 4 bytes
+
+with open("sim_data.bin", "rb") as f:
+    # Read frame 0
+    data = np.fromfile(f, dtype=np.float32, count=4 * W * H)
+    data = data.reshape((4, H, W))
+    
+    density = data[0]
+    velocity_x = data[1]
+    velocity_y = data[2]
+    mask = data[3]
+```

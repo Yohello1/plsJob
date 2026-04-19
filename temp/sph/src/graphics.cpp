@@ -8,13 +8,15 @@
 #include <fstream>
 #include <string>
 #include <iostream>
+#include <sycl/sycl.hpp>
+#include "sycl.hpp"
 
 namespace JD::graphics {
 
-    uint8_t static_rgb_buffer[BUFFER_WIDTH * BUFFER_HEIGHT * BYTES_PER_PIXEL];
-    int offsets[BUFFER_LINE * BUFFER_LINE];
-    int cells_ctr[BUFFER_LINE * BUFFER_LINE];
-    int particles_loc[FLOATER_AMT];
+    uint8_t* static_rgb_buffer = nullptr;
+    int* offsets = nullptr;
+    int* cells_ctr = nullptr;
+    int* particles_loc = nullptr;
 
     // TODO make this a calculation based function lol
     point* points = new point[POINTS_AMT];
@@ -72,7 +74,36 @@ namespace JD::graphics {
         }
     }
 
-    void InitializeStaticBuffer() {
+    void initBuffers() {
+        if (static_rgb_buffer == nullptr) {
+            static_rgb_buffer = ::sycl::malloc_shared<uint8_t>(
+                (size_t)BUFFER_HEIGHT * BUFFER_WIDTH * BYTES_PER_PIXEL, 
+                JD::sycl::compute_queue
+            );
+        }
+
+
+        if (offsets == nullptr) {
+            offsets = ::sycl::malloc_shared<int>(
+                (size_t) BUFFER_LINE* BUFFER_LINE,
+                JD::sycl::compute_queue
+            );
+        }
+        
+        if (cells_ctr == nullptr) {
+            cells_ctr = ::sycl::malloc_shared<int>(
+                (size_t) BUFFER_LINE * BUFFER_LINE,
+                JD::sycl::compute_queue
+            );
+        }
+        
+        if (particles_loc == nullptr) {
+            particles_loc = ::sycl::malloc_shared<int>(
+                (size_t) FLOATER_AMT,
+                JD::sycl::compute_queue
+            );
+        }
+        
         for (int y = 0; y < BUFFER_HEIGHT; ++y) {
             for (int x = 0; x < BUFFER_WIDTH; ++x) {
                 int buffer_index = (y * BUFFER_WIDTH + x) * BYTES_PER_PIXEL;

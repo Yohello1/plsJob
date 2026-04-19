@@ -39,15 +39,15 @@ def get_coord_grid(h, w, device):
     return grid.unsqueeze(0) # [1, 2, H, W]
 
 class ResBlock(nn.Module):
-    """Residual block to help deeper networks learn more effectively."""
-    def __init__(self, c):
+    """Residual block with support for dilated convolutions to increase receptive field."""
+    def __init__(self, c, dilation=1):
         super().__init__()
-        # Using GroupNorm instead of BatchNorm for better stability (especially with batch_size=1)
+        # Padding must match dilation for 3x3 kernels to preserve spatial dimensions
         self.conv = nn.Sequential(
-            nn.Conv2d(c, c, 3, padding=1),
+            nn.Conv2d(c, c, 3, padding=dilation, dilation=dilation),
             nn.GroupNorm(8, c), # 8 groups is a robust default
             ACT(),
-            nn.Conv2d(c, c, 3, padding=1),
+            nn.Conv2d(c, c, 3, padding=dilation, dilation=dilation),
             nn.GroupNorm(8, c)
         )
     def _inner_forward(self, x):
@@ -165,11 +165,11 @@ class Encoder(nn.Module):
         # Input channels: p_d(1), p_v(2), c_d(1), c_v(2), mask(1) + COORD_X(1), COORD_Y(1) = 9
         self.conv = nn.Sequential(
             nn.Conv2d(9, 64, 3, stride=2, padding=1),   
-            ResBlock(64),
+            ResBlock(64),                                # 200x200
             nn.Conv2d(64, 128, 3, stride=2, padding=1), 
-            ResBlock(128),
+            ResBlock(128, dilation=2),                  # 100x100 (Increased receptive field)
             nn.Conv2d(128, 128, 3, stride=2, padding=1),
-            ResBlock(128),
+            ResBlock(128, dilation=4),                  # 50x50   (Global context capture)
             nn.Flatten()
         )
         self.fc = nn.Linear(128 * 50 * 50, latent_dim)
@@ -195,7 +195,7 @@ class Decoder(nn.Module):
         self.up_50_to_100 = nn.Sequential(
             nn.Conv2d(128 + 128, 512, 3, padding=1), # (z + context_50)
             nn.PixelShuffle(2),                      # Output: 128 channels, 100x100
-            ResBlock(128)
+            ResBlock(128, dilation=2)                # Reconstruct sharp global edges
         )
         # 100x100 Stage
         self.up_100_to_200 = nn.Sequential(

@@ -3,31 +3,43 @@
 #include "floaters.hpp"
 #include "graphics.hpp"
 #include "struct.hpp"
+#include <sycl/sycl.hpp>
+#include "sycl.hpp"
 
 namespace JD::floaters
 {
 
     floaters_soa floatersA = {
-        new float [ FLOATER_AMT ],
-        new float [ FLOATER_AMT ],
-        new float [ FLOATER_AMT ],
-        new float [ FLOATER_AMT ],
-        new float [ FLOATER_AMT ],
-        new float [ FLOATER_AMT ],
-        new float [ FLOATER_AMT ],
-        new float [ FLOATER_AMT ],
-        new float [ FLOATER_AMT ],
-        new float [ FLOATER_AMT ],
-        new float [ FLOATER_AMT ],
-        new float [ FLOATER_AMT ],
-        new float [ FLOATER_AMT ],
-        new bool  [ FLOATER_AMT ]
+        nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr
     };
-    block*   blocks    = new block  [ BLOCK_AMT   ];
+    block*   blocks    = nullptr;
 
 
     void init(float spawn_x, float spawn_y, const std::vector<SpawnBox>& fluidBoxes, const std::vector<SpawnBox>& ghostBoxes)
     {
+        if (floatersA.x == nullptr) {
+            floatersA.density  = ::sycl::malloc_shared<float>(FLOATER_AMT, JD::sycl::compute_queue);
+            floatersA.p_x      = ::sycl::malloc_shared<float>(FLOATER_AMT, JD::sycl::compute_queue);
+            floatersA.p_y      = ::sycl::malloc_shared<float>(FLOATER_AMT, JD::sycl::compute_queue);
+            floatersA.x        = ::sycl::malloc_shared<float>(FLOATER_AMT, JD::sycl::compute_queue);
+            floatersA.y        = ::sycl::malloc_shared<float>(FLOATER_AMT, JD::sycl::compute_queue);
+            floatersA.v_x      = ::sycl::malloc_shared<float>(FLOATER_AMT, JD::sycl::compute_queue);
+            floatersA.v_y      = ::sycl::malloc_shared<float>(FLOATER_AMT, JD::sycl::compute_queue);
+            floatersA.v_x_h    = ::sycl::malloc_shared<float>(FLOATER_AMT, JD::sycl::compute_queue);
+            floatersA.v_y_h    = ::sycl::malloc_shared<float>(FLOATER_AMT, JD::sycl::compute_queue);
+            floatersA.a_x      = ::sycl::malloc_shared<float>(FLOATER_AMT, JD::sycl::compute_queue);
+            floatersA.a_y      = ::sycl::malloc_shared<float>(FLOATER_AMT, JD::sycl::compute_queue);
+            floatersA.mass     = ::sycl::malloc_shared<float>(FLOATER_AMT, JD::sycl::compute_queue);
+            floatersA.pressure = ::sycl::malloc_shared<float>(FLOATER_AMT, JD::sycl::compute_queue);
+            floatersA.enabled  = ::sycl::malloc_shared<bool> (FLOATER_AMT, JD::sycl::compute_queue);
+        }
+
+        if (blocks == nullptr) {
+            blocks = ::sycl::malloc_shared<block>(BLOCK_AMT, JD::sycl::compute_queue);
+        }
+
         initFloaters(spawn_x, spawn_y, fluidBoxes, ghostBoxes);
         initBlockRegions();
     }

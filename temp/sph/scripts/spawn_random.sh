@@ -2,9 +2,9 @@
 # SPH Simulation Random Spawner (400x400 Resolution Optimized)
 # Prevents fluid from intersecting with ghost boxes
 
-if [ -n "$SLURM_ARRAY_TASK_ID" ]; then
-    RANDOM=$SLURM_ARRAY_TASK_ID
-fi
+# Seed RANDOM with nanoseconds + PID to ensure uniqueness in parallel runs
+# We use a subshell and cut to get a reasonably sized integer for Bash's RANDOM
+RANDOM=$(( (10#$(date +%N | cut -b4-9) + $$) % 32768 ))
 
 # Resolution Boundaries (400x400)
 MIN_X=50
@@ -107,5 +107,5 @@ done
 # Run Simulation
 FRAME_COUNT=${1:-10000}
 echo "Executing: ./draw2 $FRAME_COUNT --headless $FLUID_ARGS $GHOST_ARGS"
-../draw2 $FRAME_COUNT --headless $FLUID_ARGS $GHOST_ARGS
+../draw2 $FRAME_COUNT $FLUID_ARGS $GHOST_ARGS
 
