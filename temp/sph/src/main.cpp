@@ -126,6 +126,7 @@ int main(int argc, char** argv) {
 
     std::cout << std::fixed << std::setprecision(2);
 
+    JD::graphics::initBuffers();
 #ifdef USE_SDL
     SDL_Window* window = nullptr;
     SDL_Surface* screenSurface = nullptr;
@@ -137,8 +138,6 @@ int main(int argc, char** argv) {
             std::cerr << "SDL could not initialize! SDL_Error: " << SDL_GetError() << std::endl;
             return 1;
         }
-
-        JD::graphics::initBuffers();
 
         window = SDL_CreateWindow(
             "Viewport Render",
@@ -217,6 +216,10 @@ int main(int argc, char** argv) {
 
         static int frame_num = 0;
         frame_num++;
+        
+        if (frame_num % 1 == 0) { 
+           JD::logging::log(frame_num);
+        }
 
         std::chrono::duration<double, std::milli> ms_grid = t_grid_end - t_grid_start;
         std::chrono::duration<double, std::milli> ms_sim = t_sim_end - t_sim_start;

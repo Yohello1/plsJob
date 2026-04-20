@@ -96,6 +96,11 @@ namespace JD::graphics {
                 JD::sycl::compute_queue
             );
         }
+
+        if(cells_ctr == nullptr || cells_ctr == 0)
+        {
+            std::cout << "I pooped my pants";
+        }
         
         if (particles_loc == nullptr) {
             particles_loc = ::sycl::malloc_shared<int>(

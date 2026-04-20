@@ -30,8 +30,8 @@ inline constexpr int POINTS_AMT = (POINTS_HEIGHT)*(POINTS_WIDTH);
 inline constexpr float THRESHOLD = 0.05f;
 
 // Window settings
-const int WINDOW_WIDTH = 784;
-const int WINDOW_HEIGHT = 784;
+const int WINDOW_WIDTH = 2000;
+const int WINDOW_HEIGHT = 2000;
 
 //   actual resting density ≈ 0.18 (Poly6 self-contribution * neighbour count)
 //   keep reference density close to expected resting density to minimise rest pressure

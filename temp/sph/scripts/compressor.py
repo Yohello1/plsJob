@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils import spectral_norm as sn
 import numpy as np
 import os
 import glob
@@ -10,6 +11,12 @@ import sys
 import random
 import gc
 from torch.utils.checkpoint import checkpoint
+import torch.backends.cudnn as cudnn
+
+# Hardware Optimization: Enable TF32 for Ampere+ GPUs
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+cudnn.benchmark = True
 
 # Constants based on SPH settings (Updated to 400x400)
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -44,10 +51,10 @@ class ResBlock(nn.Module):
         super().__init__()
         # Padding must match dilation for 3x3 kernels to preserve spatial dimensions
         self.conv = nn.Sequential(
-            nn.Conv2d(c, c, 3, padding=dilation, dilation=dilation),
+            sn(nn.Conv2d(c, c, 3, padding=dilation, dilation=dilation)),
             nn.GroupNorm(8, c), # 8 groups is a robust default
             ACT(),
-            nn.Conv2d(c, c, 3, padding=dilation, dilation=dilation),
+            sn(nn.Conv2d(c, c, 3, padding=dilation, dilation=dilation)),
             nn.GroupNorm(8, c)
         )
     def _inner_forward(self, x):
@@ -164,11 +171,11 @@ class Encoder(nn.Module):
         super().__init__()
         # Input channels: p_d(1), p_v(2), c_d(1), c_v(2), mask(1) + COORD_X(1), COORD_Y(1) = 9
         self.conv = nn.Sequential(
-            nn.Conv2d(9, 64, 3, stride=2, padding=1),   
+            sn(nn.Conv2d(9, 64, 3, stride=2, padding=1)),   
             ResBlock(64),                                # 200x200
-            nn.Conv2d(64, 128, 3, stride=2, padding=1), 
+            sn(nn.Conv2d(64, 128, 3, stride=2, padding=1)), 
             ResBlock(128, dilation=2),                  # 100x100 (Increased receptive field)
-            nn.Conv2d(128, 128, 3, stride=2, padding=1),
+            sn(nn.Conv2d(128, 128, 3, stride=2, padding=1)),
             ResBlock(128, dilation=4),                  # 50x50   (Global context capture)
             nn.Flatten()
         )
@@ -185,27 +192,27 @@ class Decoder(nn.Module):
         
         # STREAMING-FRIENDLY CONTEXT: Borrow sharp edges + absolute coordinates
         # Input channels: prev_d(1), mask(1), coord_x(1), coord_y(1) = 4
-        self.context_400 = nn.Sequential(nn.Conv2d(4, 16, 3, padding=1), ACT())
-        self.context_200 = nn.Sequential(nn.Conv2d(16, 32, 3, stride=2, padding=1), ACT())
-        self.context_100 = nn.Sequential(nn.Conv2d(32, 64, 3, stride=2, padding=1), ACT())
-        self.context_50  = nn.Sequential(nn.Conv2d(64, 128, 3, stride=2, padding=1), ACT())
+        self.context_400 = nn.Sequential(sn(nn.Conv2d(4, 16, 3, padding=1)), ACT())
+        self.context_200 = nn.Sequential(sn(nn.Conv2d(16, 32, 3, stride=2, padding=1)), ACT())
+        self.context_100 = nn.Sequential(sn(nn.Conv2d(32, 64, 3, stride=2, padding=1)), ACT())
+        self.context_50  = nn.Sequential(sn(nn.Conv2d(64, 128, 3, stride=2, padding=1)), ACT())
         
         # Sub-pixel Convolution (PixelShuffle) with context injection
         # 50x50 Stage
         self.up_50_to_100 = nn.Sequential(
-            nn.Conv2d(128 + 128, 512, 3, padding=1), # (z + context_50)
+            sn(nn.Conv2d(128 + 128, 512, 3, padding=1)), # (z + context_50)
             nn.PixelShuffle(2),                      # Output: 128 channels, 100x100
             ResBlock(128, dilation=2)                # Reconstruct sharp global edges
         )
         # 100x100 Stage
         self.up_100_to_200 = nn.Sequential(
-            nn.Conv2d(128 + 64, 256, 3, padding=1), # (up_128 + context_100)
+            sn(nn.Conv2d(128 + 64, 256, 3, padding=1)), # (up_128 + context_100)
             nn.PixelShuffle(2),                      # Output: 64 channels, 200x200
             ResBlock(64)
         )
         # 200x200 Stage
         self.up_200_to_400 = nn.Sequential(
-            nn.Conv2d(64 + 32, 4, 3, padding=1),   # (up_64 + context_200)
+            sn(nn.Conv2d(64 + 32, 4, 3, padding=1)),   # (up_64 + context_200)
             nn.PixelShuffle(2)                       # Output: 1 channel, 400x400
         )
         
@@ -469,17 +476,50 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     
     print(f"Batch Size: {batch_size} | Effective Batch: {effective_batch} (Accumulation Steps: {accumulation_steps})")
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True)
+    # Hardware-specific DataLoader tuning
+    num_workers = 8 # Optimized for 10-core SBATCH allocation
+    
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        num_workers=num_workers, 
+        pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=2 if num_workers > 0 else None
+    )
+    
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        num_workers=num_workers, 
+        pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=2 if num_workers > 0 else None
+    )
     
     if num_gpus > 1:
         model = nn.DataParallel(model)
         
     optimizer = optim.Adam(model.parameters(), lr=LR)
-    # Optional: Use Adam with lower precision or specific flags if still OOM
-    # optimizer = optim.Adam(model.parameters(), lr=LR, eps=1e-4) 
-    
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
+
+    # NEW: LOAD OPTIMIZER/SCHEDULER STATE
+    opt_path = os.path.join(output_dir, "optimizer.pth")
+    sched_path = os.path.join(output_dir, "scheduler.pth")
+    if os.path.exists(opt_path):
+        try:
+            print(f"Loading optimizer state from {opt_path}...")
+            optimizer.load_state_dict(torch.load(opt_path, map_location=device, weights_only=True))
+        except Exception as e:
+            print(f"Warning: Could not load optimizer state ({e}).")
+    if os.path.exists(sched_path):
+        try:
+            print(f"Loading scheduler state from {sched_path}...")
+            scheduler.load_state_dict(torch.load(sched_path, map_location=device, weights_only=True))
+        except Exception as e:
+            print(f"Warning: Could not load scheduler state ({e}).")
     def hybrid_loss(input, target, f_weight=fluid_weight, m_weight=effective_mass_weight, grad_weight=5.0, prev_frame=None):
         # 1. Spatial Masks: Separate the fluid from the background
         fluid_mask = (target > 0.05).float()
@@ -704,6 +744,9 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
             torch.save(model.state_dict(), os.path.join(run_dir, "best_model.pth"))
             # Also keep a copy in output_dir (run-collection root) for current state
             torch.save(model.state_dict(), os.path.join(output_dir, model_filename))
+            # SAVE OPTIMIZER/SCHEDULER STATE alongside best model
+            torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pth"))
+            torch.save(scheduler.state_dict(), os.path.join(output_dir, "scheduler.pth"))
         else:
             print(f"    (Best Val Loss remained: {best_val_loss:.8f})")
 
