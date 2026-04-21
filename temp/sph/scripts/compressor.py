@@ -13,6 +13,12 @@ import gc
 from torch.utils.checkpoint import checkpoint
 import torch.backends.cudnn as cudnn
 
+try:
+    import bitsandbytes as bnb
+    HAS_BNB = True
+except ImportError:
+    HAS_BNB = False
+
 # Hardware Optimization: Enable TF32 for Ampere+ GPUs
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -174,21 +180,26 @@ class Encoder(nn.Module):
             sn(nn.Conv2d(9, 64, 3, stride=2, padding=1)),   
             ResBlock(64),                                # 200x200
             sn(nn.Conv2d(64, 128, 3, stride=2, padding=1)), 
-            ResBlock(128, dilation=2),                  # 100x100 (Increased receptive field)
+            ResBlock(128, dilation=2),                  # 100x100
             sn(nn.Conv2d(128, 128, 3, stride=2, padding=1)),
-            ResBlock(128, dilation=4),                  # 50x50   (Global context capture)
-            nn.Flatten()
+            ResBlock(128, dilation=4),                  # 50x50
         )
-        self.fc = nn.Linear(128 * 50 * 50, latent_dim)
+        # Bottleneck compression: Reduce channels before large linear layer to save VRAM
+        self.compress = sn(nn.Conv2d(128, 32, 1)) 
+        self.fc = nn.Linear(32 * 50 * 50, latent_dim)
 
     def forward(self, x):
-        return self.fc(self.conv(x))
+        x = self.conv(x)
+        x = self.compress(x)
+        x = x.flatten(1)
+        return self.fc(x)
 
 class Decoder(nn.Module):
     def __init__(self, latent_dim=1024):
         super().__init__()
-        # Bottleneck mapping
-        self.fc = nn.Linear(latent_dim, 128 * 50 * 50)
+        # Bottleneck mapping with decompression
+        self.fc = nn.Linear(latent_dim, 32 * 50 * 50)
+        self.decompress = sn(nn.Conv2d(32, 128, 1))
         
         # STREAMING-FRIENDLY CONTEXT: Borrow sharp edges + absolute coordinates
         # Input channels: prev_d(1), mask(1), coord_x(1), coord_y(1) = 4
@@ -220,7 +231,8 @@ class Decoder(nn.Module):
 
     def forward(self, z, prev_d, mask, coords):
         # 1. Map bottleneck to 50x50
-        x = self.fc(z).view(-1, 128, 50, 50)
+        x = self.fc(z).view(-1, 32, 50, 50)
+        x = self.decompress(x)
         
         # 2. Expand static coords to match batch size
         b = z.size(0)
@@ -251,12 +263,18 @@ class FullModel(nn.Module):
     def forward(self, p_d, p_v, c_d, c_v, mask):
         # p_d: [B, 1, H, W], p_v: [B, 2, H, W], etc.
         b = p_d.size(0)
-        # Expand coordinate grid to match batch size without copying memory
         coords = self.coord_grid.expand(b, -1, -1, -1)
         
-        # 9 channels: p_d(1), p_v(2), c_d(1), c_v(2), mask(1), coords(2)
-        z = self.encoder(torch.cat([p_d, p_v, c_d, c_v, mask, coords], dim=1))
-        return self.decoder(z, p_d, mask, coords)
+        # Checkpointing the entire encoder/decoder pass if in training
+        # to save activation memory for large images
+        def _inner_forward(p_d_in, p_v_in, c_d_in, c_v_in, mask_in, coords_in):
+            z = self.encoder(torch.cat([p_d_in, p_v_in, c_d_in, c_v_in, mask_in, coords_in], dim=1))
+            return self.decoder(z, p_d_in, mask_in, coords_in)
+
+        if self.training and b > 1: # Only checkpoint if batch > 1 or for AR rollouts
+             return checkpoint(_inner_forward, p_d, p_v, c_d, c_v, mask, coords, use_reentrant=False)
+        
+        return _inner_forward(p_d, p_v, c_d, c_v, mask, coords)
 
     def get_depth(self):
         count = 0
@@ -284,7 +302,10 @@ def find_max_batch_size(model, device, is_bf16=False, ar_steps=1):
         p_d, p_v, c_d, c_v, mask = [t.to(torch.bfloat16) for t in [p_d, p_v, c_d, c_v, mask]]
 
     # Mock Optimizer to account for moment memory
-    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    if HAS_BNB:
+        optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=1e-4)
+    else:
+        optimizer = optim.Adam(model.parameters(), lr=1e-4, fused=torch.cuda.is_available())
 
     model.train()
     found_batch = 1
@@ -502,7 +523,17 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     if num_gpus > 1:
         model = nn.DataParallel(model)
         
-    optimizer = optim.Adam(model.parameters(), lr=LR)
+    if HAS_BNB:
+        print("Using BitsAndBytes 8-bit AdamW for VRAM efficiency.")
+        optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=LR)
+    else:
+        # Use fused=True for standard Adam if available (PyTorch 1.13+)
+        try:
+            optimizer = optim.Adam(model.parameters(), lr=LR, fused=True)
+            print("Using Fused Adam optimizer.")
+        except:
+            optimizer = optim.Adam(model.parameters(), lr=LR)
+            print("Using Standard Adam optimizer.")
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
 
     # NEW: LOAD OPTIMIZER/SCHEDULER STATE
@@ -635,7 +666,12 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
                         c_d_in = c_d
                         c_v_in = c_v
 
-                    output = model(context_d, p_v, c_d_in, c_v_in, mask)
+                    # Checkpointing the model call during AR rollout
+                    # This prevents memory from scaling with ar_steps
+                    if ar_steps > 1 and self.training:
+                        output = checkpoint(model, context_d, p_v, c_d_in, c_v_in, mask, use_reentrant=False)
+                    else:
+                        output = model(context_d, p_v, c_d_in, c_v_in, mask)
                     
                     # Pass previous frame (densities[:, step]) for Identity baseline calculation
                     step_loss, step_metrics = criterion(output.to(torch.float32), c_d.to(torch.float32), prev_frame=densities[:, step])
@@ -643,7 +679,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
                     for k in epoch_metrics:
                         epoch_metrics[k] += step_metrics[k]
                     
-                    # Feedback for next step (Full BPTT: No detaching)
+                    # Feedback for next step
                     context_d = output
                     
                     # Optional: Add noise to context for next step to simulate drift
