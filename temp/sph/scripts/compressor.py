@@ -668,7 +668,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
 
                     # Checkpointing the model call during AR rollout
                     # This prevents memory from scaling with ar_steps
-                    if ar_steps > 1 and self.training:
+                    if ar_steps > 1 and model.training:
                         output = checkpoint(model, context_d, p_v, c_d_in, c_v_in, mask, use_reentrant=False)
                     else:
                         output = model(context_d, p_v, c_d_in, c_v_in, mask)
