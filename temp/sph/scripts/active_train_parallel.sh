@@ -65,14 +65,20 @@ for i in $(seq 5 $ITERATIONS); do
         CURRENT_EPOCHS=5
     fi
 
-    # 1. GENERATE DATA (Parallel execution)
-    echo "Launching $RUNS_PER_ITERATION simulations in parallel..."
+    # 1. GENERATE DATA (Throttled Parallel execution)
+    MAX_PARALLEL=3
+    echo "Launching $RUNS_PER_ITERATION simulations ($MAX_PARALLEL at a time)..."
     for r in $(seq 1 $RUNS_PER_ITERATION); do
         # Run in background (&), redirect logs to the run-specific log folder
         ./spawn_random.sh $FRAMES_PER_RUN > "$LOG_DIR/sim_c${i}_r${r}.log" 2>&1 &
+        
+        # If we have reached the limit, wait for any one simulation to finish before starting the next
+        if (( r >= MAX_PARALLEL )); then
+            wait -n
+        fi
     done
 
-    # Wait for all background simulation processes to finish
+    # Wait for all remaining background simulation processes to finish
     wait
     echo "All simulations for cycle $i complete."
 
