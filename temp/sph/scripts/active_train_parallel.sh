@@ -1,5 +1,5 @@
-#!/bin/bash
-#SBATCH --job-name=cuda_test
+#!/bin/bash                                                                                                                                                                             
+#SBATCH --job-name=cuda_test                                                                                                                                                            
 #SBATCH --output=logs/cuda_test_%j.log
 #SBATCH --partition=gpu-gen
 #SBATCH --nodelist=gpu-pt1-04
@@ -9,13 +9,15 @@
 
 # --- Environment Setup ---
 # Load the verified CUDA module
-module load cuda/12.4
+# module load cuda/12.4
+
+export LD_LIBRARY_PATH=/scratch/s23adhik/acpp/lib/x86_64-unknown-linux-gnu:$LD_LIBRARY_PATH
 
 source env/bin/activate
 # --- Configuration ---
 ITERATIONS=30         # Increased for 10-step Marathon
-RUNS_PER_ITERATION=10 # Parallel simulations per cycle
-MAX_SESSIONS=30       # Keep last N folders per run
+RUNS_PER_ITERATION=15 # Parallel simulations per cycle
+MAX_SESSIONS=20       # Keep last N folders per run
 FRAMES_PER_RUN=750    # Frames per simulation
 MASS_LOSS_START_CYCLE=2
 MASS_LOSS_WEIGHT=2.5
@@ -27,7 +29,7 @@ AR_INCREMENT_INTERVAL=3 # Give model 3 cycles to adapt to step increases
 
 # --- Unique Run Setup ---
 # Use first argument as RUN_NAME if provided, otherwise generate a unique one
-RUN_NAME=${1:-run_$(date +%Y%m%d_%H%M%S)}
+RUN_NAME="run_20260421_032656"
 DATA_DIR="data/$RUN_NAME"
 LOG_DIR="logs/$RUN_NAME"
 ATTEMPTS_DIR="attempts/$RUN_NAME"
@@ -48,7 +50,7 @@ cd scripts
 
 echo "Starting Parallel Active Learning Loop for $RUN_NAME..."
 
-for i in $(seq 1 $ITERATIONS); do
+for i in $(seq 5 $ITERATIONS); do
     echo "----------------------------------------"
     echo " Cycle $i of $ITERATIONS (Run: $RUN_NAME)"
     echo "----------------------------------------"
@@ -96,8 +98,9 @@ for i in $(seq 1 $ITERATIONS); do
         --ar_start_cycle $AR_START_CYCLE \
         --ar_increment_interval $AR_INCREMENT_INTERVAL \
         --bf16
-    
+     
     echo "Cycle $i complete."
 done
+
 
 echo "Active Training Loop Finished for $RUN_NAME."

@@ -380,10 +380,11 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         effective_ar_steps = 1 + (current_cycle - ar_start_cycle) // ar_interval
         effective_ar_steps = min(effective_ar_steps, ar_target_steps)
 
-    if effective_mass_weight != mass_loss_weight:
-        print(f"Curriculum: Mass loss weight delayed (current cycle {current_cycle} < start cycle {start_cycle}) | Effective Weight: {effective_mass_weight}")
-    else:
-        print(f"Curriculum: Mass loss weight active (Cycle {current_cycle} >= {start_cycle}) | Effective Weight: {effective_mass_weight}")
+    if mass_loss_weight > 0:
+        if effective_mass_weight != mass_loss_weight:
+            print(f"Curriculum: Mass loss weight delayed (current cycle {current_cycle} < start cycle {start_cycle}) | Effective Weight: {effective_mass_weight}")
+        else:
+            print(f"Curriculum: Mass loss weight active (Cycle {current_cycle} >= {start_cycle}) | Effective Weight: {effective_mass_weight}")
         
     print(f"Curriculum: AR steps (Cycle {current_cycle}) | Effective Steps: {effective_ar_steps} (Target: {ar_target_steps})")
 

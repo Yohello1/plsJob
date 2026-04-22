@@ -8,7 +8,7 @@
 
 inline constexpr int DISTANCE_BETWEEN_POINTS = 8;
 
-inline constexpr int SIZE_MULTIPLIER =40;
+inline constexpr int SIZE_MULTIPLIER = 40;
 inline constexpr int INFLUENCE_RADIUS = 4; // kernel look-ahead in grid cells; increase for more particle sensitivity
 inline constexpr int PADDING = std::max(INFLUENCE_RADIUS+1, INFLUENCE_RADIUS+1);
 
@@ -30,23 +30,23 @@ inline constexpr int POINTS_AMT = (POINTS_HEIGHT)*(POINTS_WIDTH);
 inline constexpr float THRESHOLD = 0.05f;
 
 // Window settings
-const int WINDOW_WIDTH = 2000;
-const int WINDOW_HEIGHT = 2000;
+const int WINDOW_WIDTH = 640;
+const int WINDOW_HEIGHT = 640;
 
 //   actual resting density ≈ 0.18 (Poly6 self-contribution * neighbour count)
 //   keep reference density close to expected resting density to minimise rest pressure
-inline const float PARTICLE_SIZE = INFLUENCE_RADIUS * DISTANCE_BETWEEN_POINTS; // kernel radius px
-inline const float PARTICLE_TIME_STEP = 0.05f;           // smaller step for stability with high stiffness
-inline const float PARTICLE_REFERENCE_DENSITY = 0.005f;  // slightly below resting for initial expansion
+inline const float PARTICLE_SIZE = 5; // kernel radius px
+inline const float PARTICLE_TIME_STEP = 0.10f;           // smaller step for stability with high stiffness
+inline const float PARTICLE_REFERENCE_DENSITY = 0.030f;  // slightly below resting for initial expansion
 inline const float PARTICLE_BULK_MODULUS = 2000.0f;     
 inline const float PARTICLE_VISCOSITY = 0.5f;           
 inline const float PARTICLE_GRAVITY = 10.0f;           
-inline const float PARTICLE_MASS = 1.0f;                // normalised mass; pressure formula handles scaling
+inline const float PARTICLE_MASS = 0.015f;                // normalised mass; pressure formula handles scaling
 inline const float PARTICLE_REPULSION = 0.5*PARTICLE_BULK_MODULUS;
 // until i learn how to write code :(
 inline const float PARTICLE_MAX_V = 7.5f;
 inline const float PARTICLE_RESTITUTION = 1.0f;
-inline const int PARTICLE_GHOST_DENSITY = 4;
+inline const int PARTICLE_GHOST_DENSITY = 1;
 
 // am I even using these?
 inline const int PARTICLE_N_FRAMES = 0; // Number of frames
@@ -56,8 +56,8 @@ inline const int PARTICLE_NP_FRAMES = 0; // Steps per frame
 inline const float PARTICLE_VISCOSITY_K_COEFF = 25.0f/std::numbers::pi_v<float> * 1.00000; 
 inline const float PARTICLE_SPIKY_K = -45.0f / (std::numbers::pi_v<float> * std::pow(PARTICLE_SIZE, 6)); 
 
-inline constexpr size_t DESIRED_FLOATERS = 5000;
-inline constexpr size_t GHOST_FLOATERS = 200000;  // should be a function/equation but I cannot rn make it up - siracha at 3:45am
+inline constexpr size_t DESIRED_FLOATERS = 20000;
+inline constexpr size_t GHOST_FLOATERS = 2000000;  // should be a function/equation but I cannot rn make it up - siracha at 3:45am
 inline constexpr size_t FLOATER_AMT = DESIRED_FLOATERS + GHOST_FLOATERS;  
 inline constexpr int FLOATER_SPEED = 3;
 
