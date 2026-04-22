@@ -35,7 +35,7 @@ const int WINDOW_HEIGHT = 640;
 
 //   actual resting density ≈ 0.18 (Poly6 self-contribution * neighbour count)
 //   keep reference density close to expected resting density to minimise rest pressure
-inline const float PARTICLE_SIZE = 5; // kernel radius px
+inline const float PARTICLE_SIZE = 3; // kernel radius px
 inline const float PARTICLE_TIME_STEP = 0.10f;           // smaller step for stability with high stiffness
 inline const float PARTICLE_REFERENCE_DENSITY = 0.030f;  // slightly below resting for initial expansion
 inline const float PARTICLE_BULK_MODULUS = 2000.0f;     
@@ -56,8 +56,8 @@ inline const int PARTICLE_NP_FRAMES = 0; // Steps per frame
 inline const float PARTICLE_VISCOSITY_K_COEFF = 25.0f/std::numbers::pi_v<float> * 1.00000; 
 inline const float PARTICLE_SPIKY_K = -45.0f / (std::numbers::pi_v<float> * std::pow(PARTICLE_SIZE, 6)); 
 
-inline constexpr size_t DESIRED_FLOATERS = 20000;
-inline constexpr size_t GHOST_FLOATERS = 2000000;  // should be a function/equation but I cannot rn make it up - siracha at 3:45am
+inline constexpr size_t DESIRED_FLOATERS = 50000;
+inline constexpr size_t GHOST_FLOATERS = 200000;  // should be a function/equation but I cannot rn make it up - siracha at 3:45am
 inline constexpr size_t FLOATER_AMT = DESIRED_FLOATERS + GHOST_FLOATERS;  
 inline constexpr int FLOATER_SPEED = 3;
 
