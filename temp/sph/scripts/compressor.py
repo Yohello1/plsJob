@@ -186,9 +186,10 @@ class Encoder(nn.Module):
             sn(nn.Conv2d(128, 128, 3, stride=2, padding=1)),
             ResBlock(128, dilation=4),                  # 50x50
         )
-        # Bottleneck compression: Reduce channels before large linear layer to save VRAM
-        self.compress = sn(nn.Conv2d(128, 32, 1)) 
-        self.fc = nn.Linear(32 * 50 * 50, latent_dim)
+        # Bottleneck compression: Reduce channels significantly to save VRAM for 6GB GPUs
+        # 8 * 50 * 50 = 20,000 values -> Maps to 4096 latent dim
+        self.compress = sn(nn.Conv2d(128, 8, 1)) 
+        self.fc = nn.Linear(8 * 50 * 50, latent_dim)
 
     def forward(self, x):
         x = self.conv(x)
@@ -199,9 +200,9 @@ class Encoder(nn.Module):
 class Decoder(nn.Module):
     def __init__(self, latent_dim=LATENT_DIM):
         super().__init__()
-        # Bottleneck mapping with decompression
-        self.fc = nn.Linear(latent_dim, 32 * 50 * 50)
-        self.decompress = sn(nn.Conv2d(32, 128, 1))
+        # Bottleneck mapping with decompression (8 channels to save VRAM)
+        self.fc = nn.Linear(latent_dim, 8 * 50 * 50)
+        self.decompress = sn(nn.Conv2d(8, 128, 1))
         
         # STREAMING-FRIENDLY CONTEXT: Borrow sharp edges + absolute coordinates
         # Input channels: prev_d(1), mask(1), coord_x(1), coord_y(1) = 4
@@ -232,8 +233,8 @@ class Decoder(nn.Module):
         self.final_act = nn.Sigmoid()
 
     def forward(self, z, prev_d, mask, coords):
-        # 1. Map bottleneck to 50x50
-        x = self.fc(z).view(-1, 32, 50, 50)
+        # 1. Map bottleneck back to spatial grid
+        x = self.fc(z).view(-1, 8, 50, 50)
         x = self.decompress(x)
         
         # 2. Expand static coords to match batch size
