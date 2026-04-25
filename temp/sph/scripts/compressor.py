@@ -32,7 +32,7 @@ BUFFER_HEIGHT = 400
 # Normalization factors
 DENSITY_NORM = 50.0 # Maps 0.02 max to 1.0
 VELOCITY_NORM = 1.0 / 7.5 # Maps 7.5 max to 1.0
-LATENT_DIM = 1024
+LATENT_DIM = 4096 # Increased to 4096 to prevent information suffocation
 # Activation Configuration
 ACTIVATION_TYPE = "SiLU"
 ACTIVATION_LOOKUP = {
@@ -68,7 +68,7 @@ class ResBlock(nn.Module):
         
     def forward(self, x):
         if self.training:
-            return checkpoint(self._inner_forward, x, use_reentrant=False)
+            return checkpoint(self._inner_forward, x, use_reentrant=True)
         return self._inner_forward(x)
 
 class SPHDataset(Dataset):
@@ -94,9 +94,11 @@ class SPHDataset(Dataset):
             file_size = os.path.getsize(bin_file)
             num_frames = file_size // self.frame_size
             
-            # Ensure we have enough frames for the AR rollout
+            # Optimization: Only pick every Nth frame as a starting point
+            # This makes cycles much faster while still seeing all unique scenarios
             max_start = num_frames - (self.n_steps * self.skip)
-            for i in range(max_start):
+            skip_val = args.skip_frames if args and hasattr(args, 'skip_frames') else 5
+            for i in range(0, max_start, skip_val):
                 self.samples.append((d_dir, i))
         
         if not self.samples:
@@ -173,7 +175,7 @@ class SPHDataset(Dataset):
         return torch.stack(densities), torch.stack(velocities), mask
 
 class Encoder(nn.Module):
-    def __init__(self, latent_dim=1024):
+    def __init__(self, latent_dim=LATENT_DIM):
         super().__init__()
         # Input channels: p_d(1), p_v(2), c_d(1), c_v(2), mask(1) + COORD_X(1), COORD_Y(1) = 9
         self.conv = nn.Sequential(
@@ -195,7 +197,7 @@ class Encoder(nn.Module):
         return self.fc(x)
 
 class Decoder(nn.Module):
-    def __init__(self, latent_dim=1024):
+    def __init__(self, latent_dim=LATENT_DIM):
         super().__init__()
         # Bottleneck mapping with decompression
         self.fc = nn.Linear(latent_dim, 32 * 50 * 50)
@@ -253,7 +255,7 @@ class Decoder(nn.Module):
         return self.final_act(x)
 
 class FullModel(nn.Module):
-    def __init__(self, latent_dim=1024):
+    def __init__(self, latent_dim=LATENT_DIM):
         super().__init__()
         self.encoder = Encoder(latent_dim)
         self.decoder = Decoder(latent_dim)
@@ -272,7 +274,7 @@ class FullModel(nn.Module):
             return self.decoder(z, p_d_in, mask_in, coords_in)
 
         if self.training and b > 1: # Only checkpoint if batch > 1 or for AR rollouts
-             return checkpoint(_inner_forward, p_d, p_v, c_d, c_v, mask, coords, use_reentrant=False)
+             return checkpoint(_inner_forward, p_d, p_v, c_d, c_v, mask, coords, use_reentrant=True)
         
         return _inner_forward(p_d, p_v, c_d, c_v, mask, coords)
 
@@ -680,7 +682,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
                     # Checkpointing the model call during AR rollout
                     # This prevents memory from scaling with ar_steps
                     if ar_steps > 1 and model.training:
-                        output = checkpoint(model, context_d, p_v, c_d_in, c_v_in, mask, use_reentrant=False)
+                        output = checkpoint(model, context_d, p_v, c_d_in, c_v_in, mask, use_reentrant=True)
                     else:
                         output = model(context_d, p_v, c_d_in, c_v_in, mask)
                     
@@ -815,6 +817,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=0, help="0 = Auto-detect maximum for GPU, >0 = fixed size")
     parser.add_argument("--effective_batch_size", type=int, default=8, help="Target batch size for optimization steps (achieved via accumulation)")
     parser.add_argument("--bf16", action="store_true", help="Use BFloat16 precision for memory savings")
+    parser.add_argument("--skip_frames", type=int, default=5, help="Only use every Nth frame as a training start point to speed up cycles")
     parser.add_argument("--noise_std", type=float, default=0.0, help="Standard deviation of Gaussian noise to inject during training")
     parser.add_argument("--ar_steps", type=int, default=1, help="Target number of autoregressive steps to train for (maximum)")
     parser.add_argument("--ar_start_cycle", type=int, default=1, help="Cycle at which to start increasing AR steps")
