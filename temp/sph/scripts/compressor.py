@@ -535,7 +535,10 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         except:
             optimizer = optim.Adam(model.parameters(), lr=LR)
             print("Using Standard Adam optimizer.")
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
+    
+    # Automatic Oscillation: Cosine Annealing with Warm Restarts
+    # T_0 is the first restart period (15 epochs), T_mult increases the period after each restart
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=15, T_mult=2, eta_min=1e-7)
 
     # NEW: LOAD OPTIMIZER/SCHEDULER STATE
     opt_path = os.path.join(output_dir, "optimizer.pth")
@@ -544,6 +547,13 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         try:
             print(f"Loading optimizer state from {opt_path}...")
             optimizer.load_state_dict(torch.load(opt_path, map_location=device, weights_only=True))
+            
+            # FORCE the learning rate from arguments (overrides the saved state)
+            # This allows manually jumping the LR back up between cycles if needed
+            requested_lr = args.lr if args and hasattr(args, 'lr') else LR
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = requested_lr
+            print(f"  Optimizer LR forced to: {requested_lr}")
         except Exception as e:
             print(f"Warning: Could not load optimizer state ({e}).")
     if os.path.exists(sched_path):
@@ -762,8 +772,11 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         for k in epoch_metrics: epoch_metrics[k] /= (len(train_loader) * ar_steps)
         for k in val_metrics: val_metrics[k] /= (len(val_loader) * ar_steps)
 
-        # Step the scheduler
-        scheduler.step(avg_val_loss)
+        # Step the scheduler (Automatic Oscillation)
+        # Calculate a global epoch index to maintain the wave across cycles
+        # This ensures the LR "boost" happens predictably as you add new data
+        global_epoch = (current_cycle - 1) * epochs + epoch
+        scheduler.step(global_epoch)
         
         print(f"Epoch {epoch+1}/{epochs}")
         print(f"    Train Loss: {avg_train_loss:.8f} | Val Loss: {avg_val_loss:.8f}")
@@ -798,6 +811,7 @@ if __name__ == "__main__":
     parser.add_argument("--fluid_weight", type=float, default=12.0)
     parser.add_argument("--mass_loss_weight", type=float, default=0.0)
     parser.add_argument("--mass_loss_start_cycle", type=int, default=5, help="At what cycle to begin applying mass loss weight")
+    parser.add_argument("--lr", type=float, default=5e-5, help="Base learning rate")
     parser.add_argument("--batch_size", type=int, default=0, help="0 = Auto-detect maximum for GPU, >0 = fixed size")
     parser.add_argument("--effective_batch_size", type=int, default=8, help="Target batch size for optimization steps (achieved via accumulation)")
     parser.add_argument("--bf16", action="store_true", help="Use BFloat16 precision for memory savings")
