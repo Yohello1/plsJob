@@ -68,7 +68,7 @@ class ResBlock(nn.Module):
         
     def forward(self, x):
         if self.training:
-            return checkpoint(self._inner_forward, x, use_reentrant=True)
+            return checkpoint(self._inner_forward, x, use_reentrant=False)
         return self._inner_forward(x)
 
 class SPHDataset(Dataset):
@@ -275,7 +275,7 @@ class FullModel(nn.Module):
             return self.decoder(z, p_d_in, mask_in, coords_in)
 
         if self.training and b > 1: # Only checkpoint if batch > 1 or for AR rollouts
-             return checkpoint(_inner_forward, p_d, p_v, c_d, c_v, mask, coords, use_reentrant=True)
+             return checkpoint(_inner_forward, p_d, p_v, c_d, c_v, mask, coords, use_reentrant=False)
         
         return _inner_forward(p_d, p_v, c_d, c_v, mask, coords)
 
@@ -300,6 +300,7 @@ def find_max_batch_size(model, device, is_bf16=False, ar_steps=1):
     c_d = torch.zeros(1, 1, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
     c_v = torch.zeros(1, 2, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
     mask = torch.zeros(1, 1, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
+    p_d.requires_grad_(True)
     
     if is_bf16:
         p_d, p_v, c_d, c_v, mask = [t.to(torch.bfloat16) for t in [p_d, p_v, c_d, c_v, mask]]
@@ -637,6 +638,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         
         for i, (densities, velocities, mask) in enumerate(train_loader):
             densities, velocities, mask = densities.to(device), velocities.to(device), mask.to(device)
+            densities.requires_grad_(True)
             
             # --- Physical Symmetry Augmentation (Flips) ---
             # Horizontal Flip
@@ -683,7 +685,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
                     # Checkpointing the model call during AR rollout
                     # This prevents memory from scaling with ar_steps
                     if ar_steps > 1 and model.training:
-                        output = checkpoint(model, context_d, p_v, c_d_in, c_v_in, mask, use_reentrant=True)
+                        output = checkpoint(model, context_d, p_v, c_d_in, c_v_in, mask, use_reentrant=False)
                     else:
                         output = model(context_d, p_v, c_d_in, c_v_in, mask)
                     
