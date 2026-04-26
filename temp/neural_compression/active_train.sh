@@ -24,12 +24,12 @@ mkdir -p "$DATA_DIR" "$LOG_DIR" "$ATTEMPTS_DIR"
 export SPH_DATA_ROOT="$DATA_DIR"
 
 echo "Checking fluid sim build...";
-cd ..
+cd ../sph
 if [ ! -f ./draw2 ] || [ "$BUILD" == "1" ]; then
     echo "Building (this might take a moment)..."
     make -j
 fi
-cd scripts
+cd ../neural_compression
 
 echo "Starting Active Learning Loop for $RUN_NAME..."
 

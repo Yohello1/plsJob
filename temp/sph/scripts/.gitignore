@@ -1,7 +1,0 @@
-venv/*
-data/*
-__pycache__/*
-env/*
-attempts/*
-logs/*
-best_model.pth

@@ -187,7 +187,8 @@ namespace JD::floaters
             
             if (px >= 0 && px < BUFFER_WIDTH && py >= 0 && py < BUFFER_HEIGHT) {
                 int idx = px * BYTES_PER_PIXEL + py * BUFFER_WIDTH * BYTES_PER_PIXEL;
-                JD::graphics::static_rgb_buffer[idx+1] = 250;
+                uint8_t colour = (floatersA.enabled[i]) ? 0 : 1;
+                JD::graphics::static_rgb_buffer[idx+colour] = 250;
             }
         }
     }

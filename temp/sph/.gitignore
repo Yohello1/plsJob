@@ -1,0 +1,21 @@
+# Build artifacts
+obj/
+*.o
+*.d
+draw2
+
+# Data (Recursive)
+**/data/
+**/logs/
+**/attempts/
+
+# Python cache
+**/__pycache__/
+
+# GDB history / local config
+.gdb_history
+
+# IDEs and OS files
+.vscode/
+.idea/
+.DS_Store

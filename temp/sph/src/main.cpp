@@ -217,9 +217,9 @@ int main(int argc, char** argv) {
         static int frame_num = 0;
         frame_num++;
         
-        if (frame_num % 1 == 0) { 
-           JD::logging::log(frame_num);
-        }
+        //if (frame_num % 1 == 0) { 
+        //   JD::logging::log(frame_num);
+        //}
 
         std::chrono::duration<double, std::milli> ms_grid = t_grid_end - t_grid_start;
         std::chrono::duration<double, std::milli> ms_sim = t_sim_end - t_sim_start;

@@ -41,28 +41,28 @@ mkdir -p "$DATA_DIR" "$LOG_DIR" "$ATTEMPTS_DIR"
 export SPH_DATA_ROOT="$DATA_DIR"
 
 echo "Checking fluid sim build...";
-cd ..
+cd ../sph
 # Only build if binary is missing or if explicitly requested via BUILD=1
 make clean
 make -j
 
-cd scripts
+cd ../neural_compression
 
 echo "Starting Parallel Active Learning Loop for $RUN_NAME..."
 
-for i in $(seq 5 $ITERATIONS); do
+for i in $(seq 1 $ITERATIONS); do
     echo "----------------------------------------"
     echo " Cycle $i of $ITERATIONS (Run: $RUN_NAME)"
     echo "----------------------------------------"
 
     # 0. DYNAMIC EPOCH CALCULATION
-    # Start at 3, increase to 4 at cycle 10, and 5 at cycle 20
+    # Optimized for fast iteration in Active Learning
     if [ $i -lt 10 ]; then
-        CURRENT_EPOCHS=3
+        CURRENT_EPOCHS=1
     elif [ $i -lt 20 ]; then
-        CURRENT_EPOCHS=4
+        CURRENT_EPOCHS=2
     else
-        CURRENT_EPOCHS=5
+        CURRENT_EPOCHS=3
     fi
 
     # 1. GENERATE DATA (Throttled Parallel execution)
@@ -91,6 +91,7 @@ for i in $(seq 5 $ITERATIONS); do
     ./env/bin/python compressor.py \
         --cycle $i \
         --epochs $CURRENT_EPOCHS \
+        --skip_frames 5 \
         --data_dir "$DATA_DIR" \
         --output_dir "$ATTEMPTS_DIR" \
         --model_name "best_model.pth" \
