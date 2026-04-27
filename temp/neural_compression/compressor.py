@@ -57,10 +57,10 @@ class ResBlock(nn.Module):
         super().__init__()
         # Padding must match dilation for 3x3 kernels to preserve spatial dimensions
         self.conv = nn.Sequential(
-            sn(nn.Conv2d(c, c, 3, padding=dilation, dilation=dilation)),
+            nn.Conv2d(c, c, 3, padding=dilation, dilation=dilation),
             nn.GroupNorm(8, c), # 8 groups is a robust default
             ACT(),
-            sn(nn.Conv2d(c, c, 3, padding=dilation, dilation=dilation)),
+            nn.Conv2d(c, c, 3, padding=dilation, dilation=dilation),
             nn.GroupNorm(8, c)
         )
     def _inner_forward(self, x):
@@ -180,16 +180,16 @@ class Encoder(nn.Module):
         super().__init__()
         # Input channels: p_d(1), p_v(2), c_d(1), c_v(2), mask(1) + COORD_X(1), COORD_Y(1) = 9
         self.conv = nn.Sequential(
-            sn(nn.Conv2d(9, 64, 3, stride=2, padding=1)),   
+            nn.Conv2d(9, 64, 3, stride=2, padding=1),   
             ResBlock(64),                                # 200x200
-            sn(nn.Conv2d(64, 128, 3, stride=2, padding=1)), 
+            nn.Conv2d(64, 128, 3, stride=2, padding=1), 
             ResBlock(128, dilation=2),                  # 100x100
-            sn(nn.Conv2d(128, 128, 3, stride=2, padding=1)),
+            nn.Conv2d(128, 128, 3, stride=2, padding=1),
             ResBlock(128, dilation=4),                  # 50x50
         )
         # Bottleneck compression: Reduce channels significantly to save VRAM for 6GB GPUs
         # 8 * 50 * 50 = 20,000 values -> Maps to 4096 latent dim
-        self.compress = sn(nn.Conv2d(128, 8, 1)) 
+        self.compress = nn.Conv2d(128, 8, 1) 
         self.fc = nn.Linear(8 * 50 * 50, latent_dim)
 
     def forward(self, x):
@@ -203,36 +203,36 @@ class Decoder(nn.Module):
         super().__init__()
         # Bottleneck mapping with decompression (8 channels to save VRAM)
         self.fc = nn.Linear(latent_dim, 8 * 50 * 50)
-        self.decompress = sn(nn.Conv2d(8, 128, 1))
+        self.decompress = nn.Conv2d(8, 128, 1)
         
         # STREAMING-FRIENDLY CONTEXT: Borrow sharp edges + absolute coordinates
         # Input channels: prev_d(1), mask(1), coord_x(1), coord_y(1) = 4
-        self.context_400 = nn.Sequential(sn(nn.Conv2d(4, 16, 3, padding=1)), ACT())
-        self.context_200 = nn.Sequential(sn(nn.Conv2d(16, 32, 3, stride=2, padding=1)), ACT())
-        self.context_100 = nn.Sequential(sn(nn.Conv2d(32, 64, 3, stride=2, padding=1)), ACT())
-        self.context_50  = nn.Sequential(sn(nn.Conv2d(64, 128, 3, stride=2, padding=1)), ACT())
+        self.context_400 = nn.Sequential(nn.Conv2d(4, 16, 3, padding=1), ACT())
+        self.context_200 = nn.Sequential(nn.Conv2d(16, 32, 3, stride=2, padding=1), ACT())
+        self.context_100 = nn.Sequential(nn.Conv2d(32, 64, 3, stride=2, padding=1), ACT())
+        self.context_50  = nn.Sequential(nn.Conv2d(64, 128, 3, stride=2, padding=1), ACT())
         
         # Sub-pixel Convolution (PixelShuffle) with context injection
         # 50x50 Stage
         self.up_50_to_100 = nn.Sequential(
-            sn(nn.Conv2d(128 + 128, 512, 3, padding=1)), # (z + context_50)
+            nn.Conv2d(128 + 128, 512, 3, padding=1), # (z + context_50)
             nn.PixelShuffle(2),                      # Output: 128 channels, 100x100
             ResBlock(128, dilation=2)                # Reconstruct sharp global edges
         )
         # 100x100 Stage
         self.up_100_to_200 = nn.Sequential(
-            sn(nn.Conv2d(128 + 64, 256, 3, padding=1)), # (up_128 + context_100)
+            nn.Conv2d(128 + 64, 256, 3, padding=1), # (up_128 + context_100)
             nn.PixelShuffle(2),                      # Output: 64 channels, 200x200
             ResBlock(64)
         )
         # 200x200 Stage
         self.up_200_to_400 = nn.Sequential(
-            sn(nn.Conv2d(64 + 32, 64, 3, padding=1)),   # (up_64 + context_200)
+            nn.Conv2d(64 + 32, 64, 3, padding=1),   # (up_64 + context_200)
             nn.PixelShuffle(2)                       # Output: 16 channels, 400x400
         )
         
         # 400x400 Final Fusion
-        self.final_fusion = sn(nn.Conv2d(16 + 16, 1, 3, padding=1))
+        self.final_fusion = nn.Conv2d(16 + 16, 1, 3, padding=1)
         
         self.final_act = nn.ReLU()
 
@@ -511,6 +511,12 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     
     # Hardware-specific DataLoader tuning
     num_workers = 8 # Optimized for 10-core SBATCH allocation
+    
+    if len(train_dataset) == 0:
+        print(f"CRITICAL ERROR: Train dataset is empty for data_dir: {data_dir}")
+        print(f"Check if simulations in {data_dir} actually produced frames.")
+        print(f"Required frames per sample: {ar_steps * train_dataset.skip + 1}")
+        return
     
     train_loader = DataLoader(
         train_dataset, 
