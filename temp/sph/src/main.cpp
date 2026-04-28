@@ -170,7 +170,9 @@ int main(int argc, char** argv) {
 #endif
     clock_t start, end;
 
-    while (!quit) {
+    int frame_num = 0;
+
+    while (!quit && frame_num < max_frames) {
         auto t_frame_start = std::chrono::high_resolution_clock::now();
 
 #ifdef USE_SDL
@@ -214,29 +216,26 @@ int main(int argc, char** argv) {
         simulateFloaters();
         auto t_sim_end = std::chrono::high_resolution_clock::now();
 
-        static int frame_num = 0;
         frame_num++;
-        
-        //if (frame_num % 1 == 0) { 
-        //   JD::logging::log(frame_num);
-        //}
 
+        // Log the frame data to sim_data.bin
+        JD::logging::log(frame_num);
+
+        if (max_frames > 0 && frame_num >= max_frames) {
+            quit = true;
+        }
+
+        auto t_frame_end = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double, std::milli> ms_grid = t_grid_end - t_grid_start;
         std::chrono::duration<double, std::milli> ms_sim = t_sim_end - t_sim_start;
-        std::chrono::duration<double, std::milli> ms_total = std::chrono::high_resolution_clock::now() - t_frame_start;
+        std::chrono::duration<double, std::milli> ms_total = t_frame_end - t_frame_start;
 
-        std::cout << "Frame " << (frame_num-1)
-                  << " | Grid: " << std::fixed << std::setprecision(3) << ms_grid.count() << "ms"
-                  << " | Sim: " << ms_sim.count() << "ms"
-                  << " | Total: " << ms_total.count() << "ms" << std::endl;
-    
-        std::string frame_name = base + "/frames/";
-        frame_name += std::to_string(frame_num);
-        std::cout << "NAME:" <<  frame_name << '\n';
-        frame_name += ".ppm";
-        std::cout << "NAME:" << frame_name << '\n';
-
-        // JD::graphics::outputPPM(BUFFER_HEIGHT, BUFFER_WIDTH, frame_name);
+        if (frame_num % 10 == 0) { // Reduce stdout spam
+            std::cout << "Frame " << (frame_num-1)
+                      << " | Grid: " << std::fixed << std::setprecision(3) << ms_grid.count() << "ms"
+                      << " | Sim: " << ms_sim.count() << "ms"
+                      << " | Total: " << ms_total.count() << "ms" << std::endl;
+        }
     }
 
 #ifdef USE_SDL
