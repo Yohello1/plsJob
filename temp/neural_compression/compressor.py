@@ -34,8 +34,8 @@ ACTIVATION_LOOKUP = {
 }
 ACT = ACTIVATION_LOOKUP[ACTIVATION_TYPE]
 
+# coord matrix thingy
 def get_coord_grid(batch_size, h, w, device):
-    """Generates X and Y coordinate channels ranging from -1 to 1."""
     yy = torch.linspace(-1, 1, h, device=device)
     xx = torch.linspace(-1, 1, w, device=device)
     grid_y, grid_x = torch.meshgrid(yy, xx, indexing='ij')
@@ -74,7 +74,7 @@ class SPHDataset(Dataset):
         self.frame_size = 4 * BUFFER_WIDTH * BUFFER_HEIGHT * 4 # 4 fields * N * 4 bytes
         self.field_size = BUFFER_WIDTH * BUFFER_HEIGHT * 4
         self.order = {"d": 0, "v_x": 1, "v_y": 2, "m": 3}
-        self.handles = {} # Local handle cache to avoid NFS re-opening
+        self.handles = {} # I was told this improves nfs perf 
 
         for d_dir in self.data_dirs:
             bin_file = os.path.join(d_dir, "sim_data.bin")
@@ -84,15 +84,13 @@ class SPHDataset(Dataset):
             file_size = os.path.getsize(bin_file)
             num_frames = file_size // self.frame_size
             
-            # Ensure we have enough frames for the sequence
             for i in range(num_frames - self.skip * self.n_steps):
-                # Store (directory, start_frame_idx)
                 self.samples.append((d_dir, i))
         
-        # Speed up training cycles by sampling only every Nth frame during initialization
         if skip_initial > 1:
             self.samples = self.samples[::skip_initial]
 
+    # literally half of this was to handle the shitty hardware Im on
     def _get_handle(self, data_dir):
         if data_dir not in self.handles:
             path = os.path.join(data_dir, "sim_data.bin")
@@ -100,16 +98,13 @@ class SPHDataset(Dataset):
         return self.handles[data_dir]
 
     def load_frame_data(self, data_dir, frame_idx):
-        """Optimized: Reads all 4 fields (p_d, v_x, v_y, mask) in one go if possible"""
         handle = self._get_handle(data_dir)
         offset = frame_idx * self.frame_size
         handle.seek(offset)
         
-        # Read the entire 4-field block into memory at once
         raw_data = np.fromfile(handle, dtype=np.float32, count=4 * BUFFER_WIDTH * BUFFER_HEIGHT)
         raw_data = raw_data.reshape((4, BUFFER_HEIGHT, BUFFER_WIDTH))
         
-        # Unpack fields (no more multiple seeks!)
         d = torch.from_numpy(raw_data[0]).unsqueeze(0)
         v = torch.from_numpy(raw_data[1:3]) # v_x, v_y
         m = torch.from_numpy(raw_data[3]).unsqueeze(0)
@@ -124,8 +119,6 @@ class SPHDataset(Dataset):
         offset = frame_idx * self.frame_size + field_offset
         
         path = os.path.join(data_dir, "sim_data.bin")
-        # Optimization: keep files open or use memmap if needed, 
-        # but seek + fromfile is a good start for IOPS improvement
         with open(path, "rb") as f:
             f.seek(offset)
             data = np.fromfile(f, dtype=dtype, count=BUFFER_WIDTH * BUFFER_HEIGHT)
@@ -133,21 +126,20 @@ class SPHDataset(Dataset):
         data = data.reshape((BUFFER_HEIGHT, BUFFER_WIDTH))
         tensor = torch.tensor(data, dtype=torch.float32).unsqueeze(0)
         
-        # Apply normalization based on data type
+        # noramlisation!!!! 
         if suffix == "d":
             return tensor * DENSITY_NORM
         elif suffix.startswith("v"):
             return tensor * VELOCITY_NORM
         return tensor
 
+    # The last data bender did some data bending (augmentation)
     def __getitem__(self, idx):
         data_dir, start_idx = self.samples[idx]
         
-        # Load Sequence Data
         frames_d = []
         frames_v = []
         
-        # Random Physical Symmetry Flips (Data Augmentation)
         flip_h = random.random() > 0.5
         flip_v = random.random() > 0.5
         
@@ -155,20 +147,18 @@ class SPHDataset(Dataset):
             f_idx = start_idx + step * self.skip
             d, v, m = self.load_frame_data(data_dir, f_idx)
             
-            # Normalization
             d = d * DENSITY_NORM
             v = v * VELOCITY_NORM
             
-            # Apply physical symmetry with velocity correction
             if flip_h:
                 d = torch.flip(d, [-1])
                 v = torch.flip(v, [-1])
-                v[0] *= -1.0 # Negate X-velocity for horizontal flip
+                v[0] *= -1.0
                 m = torch.flip(m, [-1])
             if flip_v:
                 d = torch.flip(d, [-2])
                 v = torch.flip(v, [-2])
-                v[1] *= -1.0 # Negate Y-velocity for vertical flip
+                v[1] *= -1.0
                 m = torch.flip(m, [-2])
             
             frames_d.append(d)
@@ -186,7 +176,6 @@ class SPHDataset(Dataset):
 class Encoder(nn.Module):
     def __init__(self, latent_dim=1024):
         super().__init__()
-        # Input channels: p_d(1), p_v(2), c_d(1), c_v(2), mask(1) + COORD_X(1), COORD_Y(1) = 9
         self.conv = nn.Sequential(
             nn.Conv2d(9, 64, 3, stride=2, padding=1),   
             ResBlock(64),
@@ -240,16 +229,33 @@ class Decoder(nn.Module):
         x = self.fc(z).view(-1, 128, 50, 50)
         
         # 2. Extract Context "Blueprints" from Previous Frame + Mask + Coords
-        ctx_400 = self.context_400(torch.cat([prev_d, mask, coords], dim=1))
-        ctx_200 = self.context_200(ctx_400)
-        ctx_100 = self.context_100(ctx_200)
-        ctx_50  = self.context_50(ctx_100)
+        # We can checkpoint context extraction to save memory on skip connections
+        def get_context(pd, mk, cr):
+            c400 = self.context_400(torch.cat([pd, mk, cr], dim=1))
+            c200 = self.context_200(c400)
+            c100 = self.context_100(c200)
+            c50  = self.context_50(c100)
+            return c400, c200, c100, c50
+
+        if self.training:
+            ctx_400, ctx_200, ctx_100, ctx_50 = checkpoint(get_context, prev_d, mask, coords, use_reentrant=False)
+        else:
+            ctx_400, ctx_200, ctx_100, ctx_50 = get_context(prev_d, mask, coords)
         
         # 3. Upsample while injecting high-res context at each step
-        x = self.up_50_to_100(torch.cat([x, ctx_50], dim=1))
-        x = self.up_100_to_200(torch.cat([x, ctx_100], dim=1))
-        # Inject the 200x200 details right before the final 400x400 expansion
-        x = self.up_200_to_400(torch.cat([x, ctx_200], dim=1))
+        # Use checkpoint for each major upsampling stage
+        def stage1(feat, ctx): return self.up_50_to_100(torch.cat([feat, ctx], dim=1))
+        def stage2(feat, ctx): return self.up_100_to_200(torch.cat([feat, ctx], dim=1))
+        def stage3(feat, ctx): return self.up_200_to_400(torch.cat([feat, ctx], dim=1))
+
+        if self.training:
+            x = checkpoint(stage1, x, ctx_50, use_reentrant=False)
+            x = checkpoint(stage2, x, ctx_100, use_reentrant=False)
+            x = checkpoint(stage3, x, ctx_200, use_reentrant=False)
+        else:
+            x = stage1(x, ctx_50)
+            x = stage2(x, ctx_100)
+            x = stage3(x, ctx_200)
         
         return self.final_act(x)
 
@@ -276,21 +282,21 @@ class FullModel(nn.Module):
                 count += 1
         return count
 
-def find_max_batch_size(model, device, is_bf16=False):
-    """Auto-detects the largest power-of-2 (or multiple) batch size that fits in VRAM."""
-    print("Auto-detecting maximum possible batch size...")
+def find_max_batch_size(model, device, n_steps=1, is_bf16=False):
+    """Auto-detects the largest power-of-2 (or multiple) batch size that fits in VRAM, accounting for AR steps."""
+    print(f"Auto-detecting maximum possible batch size (for {n_steps} AR steps)...")
     torch.cuda.empty_cache()
     gc.collect()
     
     # Mock inputs matching FullModel.forward(p_d, p_v, c_d, c_v, mask)
     p_d = torch.randn(1, 1, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
     p_v = torch.randn(1, 2, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
-    c_d = torch.randn(1, 1, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
-    c_v = torch.randn(1, 2, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
+    c_ds = torch.randn(1, n_steps, 1, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
+    c_vs = torch.randn(1, n_steps, 2, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
     mask = torch.randn(1, 1, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
     
     if is_bf16:
-        p_d, p_v, c_d, c_v, mask = [t.to(torch.bfloat16) for t in [p_d, p_v, c_d, c_v, mask]]
+        p_d, p_v, c_ds, c_vs, mask = [t.to(torch.bfloat16) for t in [p_d, p_v, c_ds, c_vs, mask]]
 
     model.train()
     found_batch = 1
@@ -300,13 +306,27 @@ def find_max_batch_size(model, device, is_bf16=False):
     for b in candidates:
         try:
             with torch.amp.autocast('cuda', dtype=torch.bfloat16 if is_bf16 else torch.float16):
-                # Using expand avoids actual memory copy until the forward pass
-                out = model(p_d.expand(b, -1, -1, -1), 
-                            p_v.expand(b, -1, -1, -1),
-                            c_d.expand(b, -1, -1, -1),
-                            c_v.expand(b, -1, -1, -1),
-                            mask.expand(b, -1, -1, -1))
-                loss = out.sum()
+                # Simulate the training loop AR rollout
+                curr_p_d = p_d.expand(b, -1, -1, -1)
+                curr_p_v = p_v.expand(b, -1, -1, -1)
+                curr_mask = mask.expand(b, -1, -1, -1)
+                
+                total_loss = 0
+                for s in range(n_steps):
+                    c_d = c_ds.expand(b, -1, -1, -1, -1)[:, s]
+                    c_v = c_vs.expand(b, -1, -1, -1, -1)[:, s]
+                    
+                    # We use checkpoint here if it's used in training
+                    if n_steps > 1:
+                        out = checkpoint(model, curr_p_d, curr_p_v, c_d, c_v, curr_mask, 0.0, use_reentrant=False)
+                    else:
+                        out = model(curr_p_d, curr_p_v, c_d, c_v, curr_mask)
+                        
+                    total_loss += out.sum()
+                    curr_p_d = out[:, 0:1]
+                    curr_p_v = out[:, 1:3]
+                    
+                loss = total_loss / n_steps
             loss.backward()
             model.zero_grad(set_to_none=True)
             found_batch = b
@@ -444,7 +464,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     
     if batch_size == 0:
         # Find limit on a single GPU first, then scale
-        found_limit = find_max_batch_size(model, device, is_bf16)
+        found_limit = find_max_batch_size(model, device, current_n_steps, is_bf16)
         batch_size = found_limit * max(1, num_gpus)
         print(f"Final training batch size set to: {batch_size} ({found_limit} per GPU)")
         # If batch size is already large enough, skip accumulation
@@ -542,7 +562,12 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
                     curr_d_gt = c_ds[:, step]
                     curr_v_gt = c_vs[:, step]
                     
-                    output = model(p_d, p_v, curr_d_gt, curr_v_gt, mask, noise_std=noise_std)
+                    # Use gradient checkpointing for the model call during AR rollout to save VRAM
+                    if current_n_steps > 1:
+                        output = checkpoint(model, p_d, p_v, curr_d_gt, curr_v_gt, mask, noise_std, use_reentrant=False)
+                    else:
+                        output = model(p_d, p_v, curr_d_gt, curr_v_gt, mask, noise_std=noise_std)
+                        
                     pred_d = output[:, 0:1]
                     pred_v = output[:, 1:3]
                     
