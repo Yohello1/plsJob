@@ -1,9 +1,7 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torch.nn.utils import spectral_norm as sn
 import numpy as np
 import os
 import glob
@@ -11,18 +9,11 @@ import sys
 import random
 import gc
 from torch.utils.checkpoint import checkpoint
-import torch.backends.cudnn as cudnn
-
 try:
     import bitsandbytes as bnb
     HAS_BNB = True
 except ImportError:
     HAS_BNB = False
-
-# Hardware Optimization: Enable TF32 for Ampere+ GPUs
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-cudnn.benchmark = True
 
 # Constants based on SPH settings (Updated to 400x400)
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -30,9 +21,9 @@ BUFFER_WIDTH = 400
 BUFFER_HEIGHT = 400
 
 # Normalization factors
-DENSITY_NORM = 33.0 # Maps 0.02 max to 1.0
+DENSITY_NORM = 50.0 # Maps 0.02 max to 1.0
 VELOCITY_NORM = 1.0 / 7.5 # Maps 7.5 max to 1.0
-LATENT_DIM = 4096 # Increased to 4096 to prevent information suffocation
+LATENT_DIM = 1024
 # Activation Configuration
 ACTIVATION_TYPE = "SiLU"
 ACTIVATION_LOOKUP = {
@@ -43,24 +34,24 @@ ACTIVATION_LOOKUP = {
 }
 ACT = ACTIVATION_LOOKUP[ACTIVATION_TYPE]
 
-def get_coord_grid(h, w, device):
+def get_coord_grid(batch_size, h, w, device):
     """Generates X and Y coordinate channels ranging from -1 to 1."""
     yy = torch.linspace(-1, 1, h, device=device)
     xx = torch.linspace(-1, 1, w, device=device)
     grid_y, grid_x = torch.meshgrid(yy, xx, indexing='ij')
     grid = torch.stack([grid_x, grid_y], dim=0) # [2, H, W]
-    return grid.unsqueeze(0) # [1, 2, H, W]
+    return grid.unsqueeze(0).repeat(batch_size, 1, 1, 1)
 
 class ResBlock(nn.Module):
-    """Residual block with support for dilated convolutions to increase receptive field."""
-    def __init__(self, c, dilation=1):
+    """Residual block to help deeper networks learn more effectively."""
+    def __init__(self, c):
         super().__init__()
-        # Padding must match dilation for 3x3 kernels to preserve spatial dimensions
+        # Using GroupNorm instead of BatchNorm for better stability (especially with batch_size=1)
         self.conv = nn.Sequential(
-            nn.Conv2d(c, c, 3, padding=dilation, dilation=dilation),
+            nn.Conv2d(c, c, 3, padding=1),
             nn.GroupNorm(8, c), # 8 groups is a robust default
             ACT(),
-            nn.Conv2d(c, c, 3, padding=dilation, dilation=dilation),
+            nn.Conv2d(c, c, 3, padding=1),
             nn.GroupNorm(8, c)
         )
     def _inner_forward(self, x):
@@ -68,11 +59,11 @@ class ResBlock(nn.Module):
         
     def forward(self, x):
         if self.training:
-            return checkpoint(self._inner_forward, x, use_reentrant=True)
+            return checkpoint(self._inner_forward, x, use_reentrant=False)
         return self._inner_forward(x)
 
 class SPHDataset(Dataset):
-    def __init__(self, data_dirs, skip=10, n_steps=1):
+    def __init__(self, data_dirs, skip=10, n_steps=1, skip_initial=1):
         if isinstance(data_dirs, str):
             data_dirs = [data_dirs]
         self.data_dirs = data_dirs
@@ -84,7 +75,6 @@ class SPHDataset(Dataset):
         self.field_size = BUFFER_WIDTH * BUFFER_HEIGHT * 4
         self.order = {"d": 0, "v_x": 1, "v_y": 2, "m": 3}
         self.handles = {} # Local handle cache to avoid NFS re-opening
-        self.skip_val = False
 
         for d_dir in self.data_dirs:
             bin_file = os.path.join(d_dir, "sim_data.bin")
@@ -94,16 +84,14 @@ class SPHDataset(Dataset):
             file_size = os.path.getsize(bin_file)
             num_frames = file_size // self.frame_size
             
-            # Optimization: Only pick every Nth frame as a starting point
-            # This makes cycles much faster while still seeing all unique scenarios
-            max_start = num_frames - (self.n_steps * self.skip)
-            args_obj = globals().get('args')
-            skip_val = args_obj.skip_frames if args_obj and hasattr(args_obj, 'skip_frames') else 5
-            for i in range(0, max_start, skip_val):
+            # Ensure we have enough frames for the sequence
+            for i in range(num_frames - self.skip * self.n_steps):
+                # Store (directory, start_frame_idx)
                 self.samples.append((d_dir, i))
         
-        if not self.samples:
-            self.skip_val = True
+        # Speed up training cycles by sampling only every Nth frame during initialization
+        if skip_initial > 1:
+            self.samples = self.samples[::skip_initial]
 
     def _get_handle(self, data_dir):
         if data_dir not in self.handles:
@@ -155,55 +143,69 @@ class SPHDataset(Dataset):
     def __getitem__(self, idx):
         data_dir, start_idx = self.samples[idx]
         
-        densities = []
-        velocities = []
+        # Load Sequence Data
+        frames_d = []
+        frames_v = []
         
-        # Load n_steps + 1 frames
+        # Random Physical Symmetry Flips (Data Augmentation)
+        flip_h = random.random() > 0.5
+        flip_v = random.random() > 0.5
+        
         for step in range(self.n_steps + 1):
-            frame_idx = start_idx + step * self.skip
-            d, v, m = self.load_frame_data(data_dir, frame_idx)
+            f_idx = start_idx + step * self.skip
+            d, v, m = self.load_frame_data(data_dir, f_idx)
             
-            # Apply normalization
+            # Normalization
             d = d * DENSITY_NORM
             v = v * VELOCITY_NORM
             
-            densities.append(d)
-            velocities.append(v)
+            # Apply physical symmetry with velocity correction
+            if flip_h:
+                d = torch.flip(d, [-1])
+                v = torch.flip(v, [-1])
+                v[0] *= -1.0 # Negate X-velocity for horizontal flip
+                m = torch.flip(m, [-1])
+            if flip_v:
+                d = torch.flip(d, [-2])
+                v = torch.flip(v, [-2])
+                v[1] *= -1.0 # Negate Y-velocity for vertical flip
+                m = torch.flip(m, [-2])
+            
+            frames_d.append(d)
+            frames_v.append(v)
             if step == 0:
                 mask = m.float()
         
-        # Return as tensors: [T+1, 1, H, W] and [T+1, 2, H, W]
-        return torch.stack(densities), torch.stack(velocities), mask
+        p_d = frames_d[0]
+        p_v = frames_v[0]
+        c_ds = torch.stack(frames_d[1:]) # [N, 1, H, W]
+        c_vs = torch.stack(frames_v[1:]) # [N, 2, H, W]
+        
+        return p_d, p_v, c_ds, c_vs, mask
 
 class Encoder(nn.Module):
-    def __init__(self, latent_dim=LATENT_DIM):
+    def __init__(self, latent_dim=1024):
         super().__init__()
         # Input channels: p_d(1), p_v(2), c_d(1), c_v(2), mask(1) + COORD_X(1), COORD_Y(1) = 9
         self.conv = nn.Sequential(
             nn.Conv2d(9, 64, 3, stride=2, padding=1),   
-            ResBlock(64),                                # 200x200
+            ResBlock(64),
             nn.Conv2d(64, 128, 3, stride=2, padding=1), 
-            ResBlock(128, dilation=2),                  # 100x100
+            ResBlock(128),
             nn.Conv2d(128, 128, 3, stride=2, padding=1),
-            ResBlock(128, dilation=4),                  # 50x50
+            ResBlock(128),
+            nn.Flatten()
         )
-        # Bottleneck compression: Reduce channels significantly to save VRAM for 6GB GPUs
-        # 8 * 50 * 50 = 20,000 values -> Maps to 4096 latent dim
-        self.compress = nn.Conv2d(128, 8, 1) 
-        self.fc = nn.Linear(8 * 50 * 50, latent_dim)
+        self.fc = nn.Linear(128 * 50 * 50, latent_dim)
 
     def forward(self, x):
-        x = self.conv(x)
-        x = self.compress(x)
-        x = x.flatten(1)
-        return self.fc(x)
+        return self.fc(self.conv(x))
 
 class Decoder(nn.Module):
-    def __init__(self, latent_dim=LATENT_DIM):
+    def __init__(self, latent_dim=1024):
         super().__init__()
-        # Bottleneck mapping with decompression (8 channels to save VRAM)
-        self.fc = nn.Linear(latent_dim, 8 * 50 * 50)
-        self.decompress = nn.Conv2d(8, 128, 1)
+        # Bottleneck mapping
+        self.fc = nn.Linear(latent_dim, 128 * 50 * 50)
         
         # STREAMING-FRIENDLY CONTEXT: Borrow sharp edges + absolute coordinates
         # Input channels: prev_d(1), mask(1), coord_x(1), coord_y(1) = 4
@@ -217,7 +219,7 @@ class Decoder(nn.Module):
         self.up_50_to_100 = nn.Sequential(
             nn.Conv2d(128 + 128, 512, 3, padding=1), # (z + context_50)
             nn.PixelShuffle(2),                      # Output: 128 channels, 100x100
-            ResBlock(128, dilation=2)                # Reconstruct sharp global edges
+            ResBlock(128)
         )
         # 100x100 Stage
         self.up_100_to_200 = nn.Sequential(
@@ -227,64 +229,45 @@ class Decoder(nn.Module):
         )
         # 200x200 Stage
         self.up_200_to_400 = nn.Sequential(
-            nn.Conv2d(64 + 32, 64, 3, padding=1),   # (up_64 + context_200)
-            nn.PixelShuffle(2)                       # Output: 16 channels, 400x400
+            nn.Conv2d(64 + 32, 12, 3, padding=1),   # 3 output channels (Density + Velocity) * 2^2
+            nn.PixelShuffle(2)                       # Output: 3 channels, 400x400
         )
         
-        # 400x400 Final Fusion
-        self.final_fusion = nn.Conv2d(16 + 16, 1, 3, padding=1)
-        
-        self.final_act = nn.ReLU()
+        self.final_act = nn.Sigmoid()
 
     def forward(self, z, prev_d, mask, coords):
-        # 1. Map bottleneck back to spatial grid
-        x = self.fc(z).view(-1, 8, 50, 50)
-        x = self.decompress(x)
+        # 1. Map bottleneck to 50x50
+        x = self.fc(z).view(-1, 128, 50, 50)
         
-        # 2. Expand static coords to match batch size
-        b = z.size(0)
-        batch_coords = coords.expand(b, -1, -1, -1)
-        
-        # 3. Extract Context "Blueprints" from Previous Frame + Mask + Coords
-        ctx_400 = self.context_400(torch.cat([prev_d, mask, batch_coords], dim=1))
+        # 2. Extract Context "Blueprints" from Previous Frame + Mask + Coords
+        ctx_400 = self.context_400(torch.cat([prev_d, mask, coords], dim=1))
         ctx_200 = self.context_200(ctx_400)
         ctx_100 = self.context_100(ctx_200)
         ctx_50  = self.context_50(ctx_100)
         
-        # 4. Upsample while injecting high-res context at each step
+        # 3. Upsample while injecting high-res context at each step
         x = self.up_50_to_100(torch.cat([x, ctx_50], dim=1))
         x = self.up_100_to_200(torch.cat([x, ctx_100], dim=1))
         # Inject the 200x200 details right before the final 400x400 expansion
         x = self.up_200_to_400(torch.cat([x, ctx_200], dim=1))
         
-        # Finally, inject the raw 400x400 context so it can copy sharp static features
-        x = self.final_fusion(torch.cat([x, ctx_400], dim=1))
-        
         return self.final_act(x)
 
 class FullModel(nn.Module):
-    def __init__(self, latent_dim=LATENT_DIM):
+    def __init__(self, latent_dim=1024):
         super().__init__()
         self.encoder = Encoder(latent_dim)
         self.decoder = Decoder(latent_dim)
-        # Register coordinate grid as a buffer (it's constant, no need to regenerate)
-        self.register_buffer("coord_grid", get_coord_grid(BUFFER_HEIGHT, BUFFER_WIDTH, "cpu"))
+    def forward(self, p_d, p_v, c_d, c_v, mask, noise_std=0.0):
+        # Noise injection to improve stability against drift
+        if self.training and noise_std > 0:
+            p_d = p_d + torch.randn_like(p_d) * noise_std
+            p_v = p_v + torch.randn_like(p_v) * noise_std
 
-    def forward(self, p_d, p_v, c_d, c_v, mask):
-        # p_d: [B, 1, H, W], p_v: [B, 2, H, W], etc.
-        b = p_d.size(0)
-        coords = self.coord_grid.expand(b, -1, -1, -1)
-        
-        # Checkpointing the entire encoder/decoder pass if in training
-        # to save activation memory for large images
-        def _inner_forward(p_d_in, p_v_in, c_d_in, c_v_in, mask_in, coords_in):
-            z = self.encoder(torch.cat([p_d_in, p_v_in, c_d_in, c_v_in, mask_in, coords_in], dim=1))
-            return self.decoder(z, p_d_in, mask_in, coords_in)
-
-        if self.training and b > 1: # Only checkpoint if batch > 1 or for AR rollouts
-             return checkpoint(_inner_forward, p_d, p_v, c_d, c_v, mask, coords, use_reentrant=True)
-        
-        return _inner_forward(p_d, p_v, c_d, c_v, mask, coords)
+        coords = get_coord_grid(p_d.size(0), BUFFER_HEIGHT, BUFFER_WIDTH, p_d.device).to(p_d.dtype)
+        # 9 channels: p_d(1), p_v(2), c_d(1), c_v(2), mask(1), coords(2)
+        z = self.encoder(torch.cat([p_d, p_v, c_d, c_v, mask, coords], dim=1))
+        return self.decoder(z, p_d, mask, coords)
 
     def get_depth(self):
         count = 0
@@ -293,84 +276,51 @@ class FullModel(nn.Module):
                 count += 1
         return count
 
-def find_max_batch_size(model, device, is_bf16=False, ar_steps=1):
-    """Auto-detects the largest batch size with a safety margin and realistic loss overhead."""
-    print(f"Auto-detecting maximum possible batch size for {ar_steps} AR steps...")
+def find_max_batch_size(model, device, is_bf16=False):
+    """Auto-detects the largest power-of-2 (or multiple) batch size that fits in VRAM."""
+    print("Auto-detecting maximum possible batch size...")
     torch.cuda.empty_cache()
     gc.collect()
     
-    # Mock inputs matching FullModel sequence data
-    # We use actual tensors (not just expanded ones) to simulate the real sequence memory
-    # But for detection speed, we expand just for the forward pass
-    p_d = torch.zeros(1, 1, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
-    p_v = torch.zeros(1, 2, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
-    c_d = torch.zeros(1, 1, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
-    c_v = torch.zeros(1, 2, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
-    mask = torch.zeros(1, 1, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
-    p_d.requires_grad_(True)
+    # Mock inputs matching FullModel.forward(p_d, p_v, c_d, c_v, mask)
+    p_d = torch.randn(1, 1, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
+    p_v = torch.randn(1, 2, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
+    c_d = torch.randn(1, 1, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
+    c_v = torch.randn(1, 2, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
+    mask = torch.randn(1, 1, BUFFER_HEIGHT, BUFFER_WIDTH).to(device)
     
     if is_bf16:
         p_d, p_v, c_d, c_v, mask = [t.to(torch.bfloat16) for t in [p_d, p_v, c_d, c_v, mask]]
 
-    # Mock Optimizer to account for moment memory
-    if HAS_BNB:
-        optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=1e-4)
-    else:
-        optimizer = optim.Adam(model.parameters(), lr=1e-4, fused=torch.cuda.is_available())
-
     model.train()
     found_batch = 1
-    # Try common tensor-core friendly batch sizes. Capped at 128 for stability.
-    candidates = [1, 2, 4, 8, 16, 32, 48, 64, 80, 96, 112, 128]
+    # Try common tensor-core friendly batch sizes
+    candidates = [1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128]
     
     for b in candidates:
         try:
-            # We clear memory carefully before each probe
-            torch.cuda.empty_cache()
-            
             with torch.amp.autocast('cuda', dtype=torch.bfloat16 if is_bf16 else torch.float16):
-                context_d = p_d.expand(b, -1, -1, -1)
-                total_loss = 0
-                for _ in range(ar_steps):
-                    out = model(context_d, 
-                                p_v.expand(b, -1, -1, -1),
-                                c_d.expand(b, -1, -1, -1),
-                                c_v.expand(b, -1, -1, -1),
-                                mask.expand(b, -1, -1, -1))
-                    
-                    # More realistic loss overhead: spatial operations + masks
-                    fluid_mask = (out > 0.05).float()
-                    mse = torch.sum(fluid_mask * (out - c_d.expand(b, -1, -1, -1))**2)
-                    total_loss += mse
-                    context_d = out 
-                
-                total_loss.backward()
-                optimizer.step()
-            
+                # Using expand avoids actual memory copy until the forward pass
+                out = model(p_d.expand(b, -1, -1, -1), 
+                            p_v.expand(b, -1, -1, -1),
+                            c_d.expand(b, -1, -1, -1),
+                            c_v.expand(b, -1, -1, -1),
+                            mask.expand(b, -1, -1, -1))
+                loss = out.sum()
+            loss.backward()
             model.zero_grad(set_to_none=True)
-            optimizer.zero_grad(set_to_none=True)
             found_batch = b
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
-                print(f"    Batch {b} failed: Out of Memory")
                 torch.cuda.empty_cache()
                 break
             else:
                 raise e
     
-    # Apply a Safety Margin (85%) to account for Data Loader and Fragmentation
-    safe_batch = max(1, int(found_batch * 0.85))
-    # Round down to nearest multiple of 4 if > 4 for tensor core alignment
-    if safe_batch > 4:
-        safe_batch = (safe_batch // 4) * 4
-
-    print(f"Max batch detected: {found_batch} | Safe training batch: {safe_batch}")
-    
-    # Cleanup detection garbage
-    del optimizer
+    print(f"Max batch size found: {found_batch}")
     torch.cuda.empty_cache()
     gc.collect()
-    return safe_batch
+    return found_batch
 
 def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_filename="best_model.pth", fluid_weight=50.0, mass_loss_weight=0.0, args=None):
     # Determine effective mass loss weight based on curriculum
@@ -378,26 +328,10 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     start_cycle = args.mass_loss_start_cycle if args and hasattr(args, 'mass_loss_start_cycle') else 1
     
     effective_mass_weight = mass_loss_weight if current_cycle >= start_cycle else 0.0
-    
-    # AR Curriculum Logic
-    ar_target_steps = args.ar_steps if args and hasattr(args, 'ar_steps') else 1
-    ar_start_cycle = args.ar_start_cycle if args and hasattr(args, 'ar_start_cycle') else 1
-    ar_interval = args.ar_increment_interval if args and hasattr(args, 'ar_increment_interval') else 3
-    
-    if current_cycle < ar_start_cycle:
-        effective_ar_steps = 1
+    if effective_mass_weight != mass_loss_weight:
+        print(f"Curriculum: Mass loss weight delayed (current cycle {current_cycle} < start cycle {start_cycle}) | Effective Weight: {effective_mass_weight}")
     else:
-        # Increment every N cycles: 1 + (cycles_since_start // interval)
-        effective_ar_steps = 1 + (current_cycle - ar_start_cycle) // ar_interval
-        effective_ar_steps = min(effective_ar_steps, ar_target_steps)
-
-    if mass_loss_weight > 0:
-        if effective_mass_weight != mass_loss_weight:
-            print(f"Curriculum: Mass loss weight delayed (current cycle {current_cycle} < start cycle {start_cycle}) | Effective Weight: {effective_mass_weight}")
-        else:
-            print(f"Curriculum: Mass loss weight active (Cycle {current_cycle} >= {start_cycle}) | Effective Weight: {effective_mass_weight}")
-        
-    print(f"Curriculum: AR steps (Cycle {current_cycle}) | Effective Steps: {effective_ar_steps} (Target: {ar_target_steps})")
+        print(f"Curriculum: Mass loss weight active (Cycle {current_cycle} >= {start_cycle}) | Effective Weight: {effective_mass_weight}")
 
     num_gpus = torch.cuda.device_count()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -434,9 +368,20 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     val_dirs = session_dirs[split_idx:]
     print(f"Dataset split: {len(train_dirs)} training sessions, {len(val_dirs)} validation sessions.")
 
-    ar_steps = effective_ar_steps # Use curriculum-determined steps
-    train_dataset = SPHDataset(train_dirs, n_steps=ar_steps)
-    val_dataset = SPHDataset(val_dirs, n_steps=ar_steps)
+    # Determine current AR n_steps based on curriculum
+    n_steps_limit = args.n_steps if args and hasattr(args, 'n_steps') else 1
+    ar_start = args.ar_start_cycle if args and hasattr(args, 'ar_start_cycle') else 2
+    ar_interval = args.ar_increment_interval if args and hasattr(args, 'ar_increment_interval') else 3
+    
+    current_n_steps = 1
+    if current_cycle >= ar_start:
+        current_n_steps = 1 + (current_cycle - ar_start) // ar_interval
+    current_n_steps = min(current_n_steps, n_steps_limit)
+    
+    print(f"Curriculum: n_steps = {current_n_steps} (Limit: {n_steps_limit}, Cycle: {current_cycle})")
+
+    train_dataset = SPHDataset(train_dirs, skip=args.skip_frames if args else 10, n_steps=current_n_steps, skip_initial=args.skip_initial if args else 1)
+    val_dataset = SPHDataset(val_dirs, skip=args.skip_frames if args else 10, n_steps=current_n_steps)
     skip_val = train_dataset.skip
 
     # Initialize model
@@ -480,6 +425,8 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         f.write(f"Grid Res: 400x400\n")
         f.write(f"Bottleneck: 50x50\n")
         f.write(f"Skip Frames: {skip_val}\n")
+        f.write(f"AR Steps: {current_n_steps}\n")
+        f.write(f"Noise Std: {args.noise_std if args else 0}\n")
         f.write(f"Epochs per Cycle: {epochs}\n")
         f.write(f"Train/Val Split: {len(train_dirs)}/{len(val_dirs)}\n")
         f.write(f"Loss Function: WeightedMSE (Fluid Weight: {fluid_weight})\n")
@@ -489,8 +436,6 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         f.write(f"Mass Loss Start Cycle: {start_cycle}\n")
         f.write(f"Effective Mass Loss Weight: {effective_mass_weight}\n")
         f.write(f"Model Depth (Conv Layers): {model_depth}\n")
-        f.write(f"AR Steps: {ar_steps}\n")
-        f.write(f"Noise Std: {args.noise_std if args else 0.0}\n")
 
     # 5. Data Pipelines
     # Automatically handle batch size for local training
@@ -499,7 +444,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     
     if batch_size == 0:
         # Find limit on a single GPU first, then scale
-        found_limit = find_max_batch_size(model, device, is_bf16, ar_steps=ar_steps)
+        found_limit = find_max_batch_size(model, device, is_bf16)
         batch_size = found_limit * max(1, num_gpus)
         print(f"Final training batch size set to: {batch_size} ({found_limit} per GPU)")
         # If batch size is already large enough, skip accumulation
@@ -509,87 +454,37 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     
     print(f"Batch Size: {batch_size} | Effective Batch: {effective_batch} (Accumulation Steps: {accumulation_steps})")
     
-    # Hardware-specific DataLoader tuning
-    num_workers = 8 # Optimized for 10-core SBATCH allocation
-    
-    if len(train_dataset) == 0:
-        print(f"CRITICAL ERROR: Train dataset is empty for data_dir: {data_dir}")
-        print(f"Check if simulations in {data_dir} actually produced frames.")
-        print(f"Required frames per sample: {ar_steps * train_dataset.skip + 1}")
-        return
-    
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size, 
-        shuffle=True, 
-        num_workers=num_workers, 
-        pin_memory=True,
-        persistent_workers=True if num_workers > 0 else False,
-        prefetch_factor=2 if num_workers > 0 else None
-    )
-    
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=batch_size, 
-        shuffle=False, 
-        num_workers=num_workers, 
-        pin_memory=True,
-        persistent_workers=True if num_workers > 0 else False,
-        prefetch_factor=2 if num_workers > 0 else None
-    )
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=8, pin_memory=True)
     
     if num_gpus > 1:
         model = nn.DataParallel(model)
         
-    if HAS_BNB:
-        print("Using BitsAndBytes 8-bit AdamW for VRAM efficiency.")
+    # Optimizer configuration: BitsAndBytes 8-bit AdamW or Fused Adam
+    if args and getattr(args, 'use_8bit_adam', False) and HAS_BNB:
+        print("Using BitsAndBytes 8-bit AdamW optimizer.")
         optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=LR)
     else:
-        # Use fused=True for standard Adam if available (PyTorch 1.13+)
-        try:
-            optimizer = optim.Adam(model.parameters(), lr=LR, fused=True)
-            print("Using Fused Adam optimizer.")
-        except:
-            optimizer = optim.Adam(model.parameters(), lr=LR)
-            print("Using Standard Adam optimizer.")
+        # Check for fused support (PyTorch 2.0+)
+        import inspect
+        use_fused = 'fused' in inspect.signature(optim.AdamW).parameters
+        print(f"Using standard AdamW optimizer (Fused={use_fused}).")
+        optimizer = optim.AdamW(model.parameters(), lr=LR, fused=use_fused)
+    # Optional: Use Adam with lower precision or specific flags if still OOM
+    # optimizer = optim.Adam(model.parameters(), lr=LR, eps=1e-4) 
     
-    # Automatic Oscillation: Cosine Annealing with Warm Restarts
-    # T_0 is the first restart period (15 epochs), T_mult increases the period after each restart
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=15, T_mult=2, eta_min=1e-7)
-
-    # NEW: LOAD OPTIMIZER/SCHEDULER STATE
-    opt_path = os.path.join(output_dir, "optimizer.pth")
-    sched_path = os.path.join(output_dir, "scheduler.pth")
-    if os.path.exists(opt_path):
-        try:
-            print(f"Loading optimizer state from {opt_path}...")
-            optimizer.load_state_dict(torch.load(opt_path, map_location=device, weights_only=True))
-            
-            # FORCE the learning rate from arguments (overrides the saved state)
-            # This allows manually jumping the LR back up between cycles if needed
-            requested_lr = args.lr if args and hasattr(args, 'lr') else LR
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = requested_lr
-            print(f"  Optimizer LR forced to: {requested_lr}")
-        except Exception as e:
-            print(f"Warning: Could not load optimizer state ({e}).")
-    if os.path.exists(sched_path):
-        try:
-            print(f"Loading scheduler state from {sched_path}...")
-            scheduler.load_state_dict(torch.load(sched_path, map_location=device, weights_only=True))
-        except Exception as e:
-            print(f"Warning: Could not load scheduler state ({e}).")
-    def hybrid_loss(input, target, f_weight=fluid_weight, m_weight=effective_mass_weight, grad_weight=5.0, prev_frame=None):
-        # 1. Spatial Masks: Separate the fluid from the background
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
+    def hybrid_loss(input, target, f_weight=fluid_weight, m_weight=effective_mass_weight, grad_weight=15.0):
+        # Create mask for fluid vs background
         fluid_mask = (target > 0.05).float()
         background_mask = 1.0 - fluid_mask
 
-        # 2. Weighted MSE: Focus on getting the fluid reconstruction right
-        mse_f = torch.sum(fluid_mask * (input - target) ** 2) / (fluid_mask.sum() + 1e-6)
-        mse_b = torch.sum(background_mask * (input - target) ** 2) / (background_mask.sum() + 1e-6)
-        mse_total = (f_weight * mse_f) + mse_b
+        # Calculate MSE for both regions separately
+        mse_fluid = torch.sum(fluid_mask * (input - target) ** 2) / (fluid_mask.sum() + 1e-6)
+        mse_bg = torch.sum(background_mask * (input - target) ** 2) / (background_mask.sum() + 1e-6)
+        mse_total = (f_weight * mse_fluid) + mse_bg
 
-        # 3. Gradient Consistency: Forces the model to match sharp edges (High-frequency details)
+        # Grad Consistency Term: Forces the model to match sharp edges
         in_dx = input[:, :, 1:, :] - input[:, :, :-1, :]
         in_dy = input[:, :, :, 1:] - input[:, :, :, :-1]
         tg_dx = target[:, :, 1:, :] - target[:, :, :-1, :]
@@ -597,35 +492,19 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         f_mask_dx = fluid_mask[:, :, 1:, :]
         f_mask_dy = fluid_mask[:, :, :, 1:]
         
-        grad_l = (torch.sum(f_mask_dx * (in_dx - tg_dx)**2) / (f_mask_dx.sum() + 1e-6) +
-                  torch.sum(f_mask_dy * (in_dy - tg_dy)**2) / (f_mask_dy.sum() + 1e-6))
+        grad_loss = (torch.sum(f_mask_dx * (in_dx - tg_dx)**2) / (f_mask_dx.sum() + 1e-6) +
+                     torch.sum(f_mask_dy * (in_dy - tg_dy)**2) / (f_mask_dy.sum() + 1e-6))
 
-        # 4. Global Mass Conservation: Ensures fluid doesn't disappear or appear from nowhere
-        mass_l = torch.tensor(0.0, device=input.device)
+        total_loss = mse_total + (grad_weight * grad_loss)
+
+        # Global Mass Conservation (Normalized to Mean to match MSE scale)
         if m_weight > 0:
             mass_input = torch.mean(input, dim=(1, 2, 3))
             mass_target = torch.mean(target, dim=(1, 2, 3))
-            mass_l = torch.mean((mass_input - mass_target) ** 2)
+            mass_loss = torch.mean((mass_input - mass_target) ** 2)
+            total_loss += m_weight * mass_loss
 
-        # 5. Baselines (For human readability)
-        with torch.no_grad():
-            zero_l = F.mse_loss(torch.zeros_like(target), target).item()
-            ident_l = F.mse_loss(prev_frame, target).item() if prev_frame is not None else 0.0
-
-        # 6. Total Weighted Loss
-        total_loss = mse_total + (grad_weight * grad_l) + (m_weight * mass_l)
-
-        # 7. Metrics Dictionary for human-readable logging
-        metrics = {
-            "mse_fluid": mse_f.item(),
-            "mse_bg": mse_b.item(),
-            "grad": grad_l.item(),
-            "mass": mass_l.item(),
-            "zero": zero_l,
-            "ident": ident_l
-        }
-
-        return total_loss, metrics
+        return total_loss
 
     criterion = hybrid_loss
     
@@ -638,84 +517,47 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     # Prepare loss logging
     log_file = os.path.join(run_dir, "losses.csv")
     with open(log_file, "w") as f:
-        f.write("epoch,train_loss,val_loss,mse_f,mse_b,grad,mass\n")
+        f.write("epoch,train_loss,val_loss,val_zero,val_ident,train_var,val_var\n")
 
-    best_val_loss = float('inf')
     epochs = requested_epochs if requested_epochs else 50
     for epoch in range(epochs):
         # --- TRAINING LOOP ---
         model.train()
         total_train_loss = 0
-        epoch_metrics = {"mse_fluid": 0, "mse_bg": 0, "grad": 0, "mass": 0, "zero": 0, "ident": 0}
+        total_train_var = 0
         optimizer.zero_grad(set_to_none=True)
         
-        for i, (densities, velocities, mask) in enumerate(train_loader):
-            densities, velocities, mask = densities.to(device), velocities.to(device), mask.to(device)
-            densities.requires_grad_(True)
+        for i, (p_d, p_v, c_ds, c_vs, mask) in enumerate(train_loader):
+            p_d, p_v, c_ds, c_vs, mask = p_d.to(device), p_v.to(device), c_ds.to(device), c_vs.to(device), mask.to(device)
             
-            # --- Physical Symmetry Augmentation (Flips) ---
-            # Horizontal Flip
-            if random.random() > 0.5:
-                densities = torch.flip(densities, [-1])
-                velocities = torch.flip(velocities, [-1])
-                # Flip X-velocity component (index 0)
-                velocities[:, :, 0] *= -1
-                mask = torch.flip(mask, [-1])
-            # Vertical Flip
-            if random.random() > 0.5:
-                densities = torch.flip(densities, [-2])
-                velocities = torch.flip(velocities, [-2])
-                # Flip Y-velocity component (index 1)
-                velocities[:, :, 1] *= -1
-                mask = torch.flip(mask, [-2])
-            
-            if is_bf16 and torch.cuda.is_bf16_supported():
-                densities, velocities, mask = densities.to(torch.bfloat16), velocities.to(torch.bfloat16), mask.to(torch.bfloat16)
+            if is_bf16:
+                p_d, p_v, c_ds, c_vs, mask = p_d.to(torch.bfloat16), p_v.to(torch.bfloat16), c_ds.to(torch.bfloat16), c_vs.to(torch.bfloat16), mask.to(torch.bfloat16)
 
             with torch.amp.autocast('cuda', dtype=torch.bfloat16 if is_bf16 else torch.float16):
-                loss = 0
-                context_d = densities[:, 0] # Initial previous density
+                # Autoregressive Rollout Loop
+                batch_loss = 0
+                noise_std = getattr(args, 'noise_std', 0.0)
                 
-                # Noise Injection: Add noise to the initial context
-                if args and args.noise_std > 0:
-                    context_d = context_d + torch.randn_like(context_d) * args.noise_std
-
-                for step in range(ar_steps):
-                    # Inputs for this step
-                    p_v = velocities[:, step]
-                    c_d = densities[:, step + 1]
-                    c_v = velocities[:, step + 1]
+                for step in range(current_n_steps):
+                    curr_d_gt = c_ds[:, step]
+                    curr_v_gt = c_vs[:, step]
                     
-                    # Noise Injection for GT inputs
-                    if args and args.noise_std > 0:
-                        p_v = p_v + torch.randn_like(p_v) * args.noise_std
-                        c_d_in = c_d + torch.randn_like(c_d) * args.noise_std
-                        c_v_in = c_v + torch.randn_like(c_v) * args.noise_std
-                    else:
-                        c_d_in = c_d
-                        c_v_in = c_v
-
-                    # Checkpointing the model call during AR rollout
-                    # This prevents memory from scaling with ar_steps
-                    if ar_steps > 1 and model.training:
-                        output = checkpoint(model, context_d, p_v, c_d_in, c_v_in, mask, use_reentrant=True)
-                    else:
-                        output = model(context_d, p_v, c_d_in, c_v_in, mask)
+                    output = model(p_d, p_v, curr_d_gt, curr_v_gt, mask, noise_std=noise_std)
+                    pred_d = output[:, 0:1]
+                    pred_v = output[:, 1:3]
                     
-                    # Pass previous frame (densities[:, step]) for Identity baseline calculation
-                    step_loss, step_metrics = criterion(output.to(torch.float32), c_d.to(torch.float32), prev_frame=densities[:, step])
-                    loss += step_loss
-                    for k in epoch_metrics:
-                        epoch_metrics[k] += step_metrics[k]
+                    # Density Loss (Hybrid)
+                    loss_d = criterion(pred_d.to(torch.float32), curr_d_gt.to(torch.float32))
+                    # Velocity Loss (Simple MSE)
+                    loss_v = torch.mean((pred_v.to(torch.float32) - curr_v_gt.to(torch.float32))**2)
                     
-                    # Feedback for next step
-                    context_d = output
+                    batch_loss += (loss_d + 10.0 * loss_v) # Velocity weight 10x
                     
-                    # Optional: Add noise to context for next step to simulate drift
-                    if step < ar_steps - 1 and args and args.noise_std > 0:
-                        context_d = context_d + torch.randn_like(context_d) * args.noise_std
-
-                loss = loss / (accumulation_steps * ar_steps)
+                    # Update for next step in rollout (AR)
+                    p_d = pred_d
+                    p_v = pred_v
+                
+                loss = batch_loss / (current_n_steps * accumulation_steps)
                 
             if scaler:
                 scaler.scale(loss).backward()
@@ -724,16 +566,14 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
             
             if (i + 1) % accumulation_steps == 0:
                 if scaler:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 
-            total_train_loss += (loss.item() * accumulation_steps * ar_steps)
+            total_train_loss += (loss.item() * accumulation_steps * current_n_steps)
+            total_train_var += torch.var(pred_d).item()
             
             # Periodically Clear Fragments
             if (i + 1) % 50 == 0:
@@ -743,80 +583,66 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         # Handle leftover gradients if dataset size not divisible
         if (len(train_loader) % accumulation_steps) != 0:
             if scaler:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
         
         # --- VALIDATION LOOP ---
         model.eval()
         total_val_loss = 0
-        val_metrics = {"mse_fluid": 0, "mse_bg": 0, "grad": 0, "mass": 0, "zero": 0, "ident": 0}
+        total_val_zero = 0
+        total_val_ident = 0
+        total_val_var = 0
+        total_val_gt_var = 0
         with torch.no_grad():
-            for densities, velocities, mask in val_loader:
-                densities, velocities, mask = densities.to(device), velocities.to(device), mask.to(device)
+            for p_d, p_v, c_ds, c_vs, mask in val_loader:
+                p_d, p_v, c_ds, c_vs, mask = p_d.to(device), p_v.to(device), c_ds.to(device), c_vs.to(device), mask.to(device)
                 
                 if is_bf16:
-                   densities, velocities, mask = densities.to(torch.bfloat16), velocities.to(torch.bfloat16), mask.to(torch.bfloat16)
+                   p_d, p_v, c_ds, c_vs, mask = p_d.to(torch.bfloat16), p_v.to(torch.bfloat16), c_ds.to(torch.bfloat16), c_vs.to(torch.bfloat16), mask.to(torch.bfloat16)
                 
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16 if is_bf16 else torch.float16):
-                    context_d = densities[:, 0]
-                    batch_loss = 0
-                    for step in range(ar_steps):
-                        p_v = velocities[:, step]
-                        c_d = densities[:, step + 1]
-                        c_v = velocities[:, step + 1]
-                        
-                        output = model(context_d, p_v, c_d, c_v, mask)
-                        step_loss, step_metrics = criterion(output.float(), c_d.float(), prev_frame=densities[:, step])
-                        batch_loss += step_loss.item()
-                        for k in val_metrics:
-                            val_metrics[k] += step_metrics[k]
-                        
-                        context_d = output
+                    # Validation only on the first step for baseline consistency
+                    curr_d_gt = c_ds[:, 0]
+                    curr_v_gt = c_vs[:, 0]
+                    output = model(p_d, p_v, curr_d_gt, curr_v_gt, mask)
+                    pred_d = output[:, 0:1]
                     
-                    total_val_loss += (batch_loss / ar_steps)
+                    total_val_loss += criterion(pred_d.float(), curr_d_gt.float()).item()
+                    total_val_zero += criterion(torch.zeros_like(curr_d_gt).float(), curr_d_gt.float()).item()
+                    total_val_ident += criterion(p_d.float(), curr_d_gt.float()).item()
+                    total_val_var += torch.var(pred_d.float()).item()
+                    total_val_gt_var += torch.var(curr_d_gt.float()).item()
                 
                 torch.cuda.empty_cache()
 
+        # Reports normalized MSE
         avg_train_loss = total_train_loss / len(train_loader)
         avg_val_loss = total_val_loss / len(val_loader)
+        avg_val_zero = total_val_zero / len(val_loader)
+        avg_val_ident = total_val_ident / len(val_loader)
+        avg_train_var = total_train_var / len(train_loader)
+        avg_val_var = total_val_var / len(val_loader)
+        avg_val_gt_var = total_val_gt_var / len(val_loader)
         
-        # Calculate metric averages (normalized by number of batches and AR steps)
-        for k in epoch_metrics: epoch_metrics[k] /= (len(train_loader) * ar_steps)
-        for k in val_metrics: val_metrics[k] /= (len(val_loader) * ar_steps)
-
-        # Step the scheduler (Automatic Oscillation)
-        # Calculate a global epoch index to maintain the wave across cycles
-        # This ensures the LR "boost" happens predictably as you add new data
-        global_epoch = (current_cycle - 1) * epochs + epoch
-        scheduler.step(global_epoch)
+        # Step the scheduler
+        scheduler.step(avg_val_loss)
         
         print(f"Epoch {epoch+1}/{epochs}")
         print(f"    Train Loss: {avg_train_loss:.8f} | Val Loss: {avg_val_loss:.8f}")
-        print(f"    Metrics (Val): [Fluid_MSE: {val_metrics['mse_fluid']:.6f}, BG_MSE: {val_metrics['mse_bg']:.6f}, Grad: {val_metrics['grad']:.6f}, Mass: {val_metrics['mass']:.6f}]")
-        print(f"    Baselines (Val): [Zero: {val_metrics['zero']:.6f}, Ident: {val_metrics['ident']:.6f}]")
+        print(f"    Val Baselines: [Zero: {avg_val_zero:.8f}, Ident: {avg_val_ident:.8f}]")
+        print(f"    Variance: [Train: {avg_train_var:.8f}, Val: {avg_val_var:.8f}, Val_GT: {avg_val_gt_var:.8f}]")
+        print(f"    Val Max: [Pred: {pred_d.max().item():.4f}, GT: {curr_d_gt.max().item():.4f}]")
         
         # Log to CSV
         with open(log_file, "a") as f:
-            f.write(f"{epoch+1},{avg_train_loss:.8f},{avg_val_loss:.8f},{val_metrics['mse_fluid']:.8f},{val_metrics['mse_bg']:.8f},{val_metrics['grad']:.8f},{val_metrics['mass']:.8f},{val_metrics['zero']:.8f},{val_metrics['ident']:.8f}\n")
-
-        # Save Best Model logic
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            print(f"    *** New Best Val Loss: {best_val_loss:.8f} (Saved) ***")
-            torch.save(model.state_dict(), os.path.join(run_dir, "best_model.pth"))
-            # Also keep a copy in output_dir (run-collection root) for current state
-            torch.save(model.state_dict(), os.path.join(output_dir, model_filename))
-            # SAVE OPTIMIZER/SCHEDULER STATE alongside best model
-            torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pth"))
-            torch.save(scheduler.state_dict(), os.path.join(output_dir, "scheduler.pth"))
-        else:
-            print(f"    (Best Val Loss remained: {best_val_loss:.8f})")
+            f.write(f"{epoch+1},{avg_train_loss:.8f},{avg_val_loss:.8f},{avg_val_zero:.8f},{avg_val_ident:.8f},{avg_train_var:.8f},{avg_val_var:.8f}\n")
+            
+        torch.save(model.state_dict(), os.path.join(run_dir, "best_model.pth"))
+        # Also keep a copy in output_dir (run-collection root) for current state
+        torch.save(model.state_dict(), os.path.join(output_dir, model_filename))
 
 if __name__ == "__main__":
     import argparse
@@ -826,18 +652,19 @@ if __name__ == "__main__":
     parser.add_argument("--data_dir", type=str, default="data")
     parser.add_argument("--output_dir", type=str, default="attempts")
     parser.add_argument("--model_name", type=str, default="best_model.pth")
-    parser.add_argument("--fluid_weight", type=float, default=12.0)
+    parser.add_argument("--fluid_weight", type=float, default=25.0)
     parser.add_argument("--mass_loss_weight", type=float, default=0.0)
     parser.add_argument("--mass_loss_start_cycle", type=int, default=5, help="At what cycle to begin applying mass loss weight")
-    parser.add_argument("--lr", type=float, default=5e-5, help="Base learning rate")
     parser.add_argument("--batch_size", type=int, default=0, help="0 = Auto-detect maximum for GPU, >0 = fixed size")
     parser.add_argument("--effective_batch_size", type=int, default=8, help="Target batch size for optimization steps (achieved via accumulation)")
     parser.add_argument("--bf16", action="store_true", help="Use BFloat16 precision for memory savings")
-    parser.add_argument("--skip_frames", type=int, default=5, help="Only use every Nth frame as a training start point to speed up cycles")
-    parser.add_argument("--noise_std", type=float, default=0.0, help="Standard deviation of Gaussian noise to inject during training")
-    parser.add_argument("--ar_steps", type=int, default=1, help="Target number of autoregressive steps to train for (maximum)")
-    parser.add_argument("--ar_start_cycle", type=int, default=1, help="Cycle at which to start increasing AR steps")
-    parser.add_argument("--ar_increment_interval", type=int, default=3, help="How many cycles to wait between increasing AR steps")
+    parser.add_argument("--skip_frames", type=int, default=10, help="Temporal skip between frames in sequences")
+    parser.add_argument("--n_steps", type=int, default=1, help="Maximum number of auto-regressive steps to train on")
+    parser.add_argument("--ar_start_cycle", type=int, default=2, help="Cycle index to begin multi-step AR curriculum")
+    parser.add_argument("--ar_increment_interval", type=int, default=3, help="How many cycles to wait between increasing AR step count")
+    parser.add_argument("--noise_std", type=float, default=0.0, help="Standard deviation of Gaussian noise injected into inputs during training")
+    parser.add_argument("--skip_initial", type=int, default=1, help="If > 1, sparsely samples frames during initialization to speed up cycles")
+    parser.add_argument("--use_8bit_adam", action="store_true", help="Use BitsAndBytes 8-bit AdamW optimizer for VRAM savings")
     args = parser.parse_args()
     train(args.epochs, args.data_dir, args.output_dir, args.model_name, args.fluid_weight, args.mass_loss_weight, args)
 

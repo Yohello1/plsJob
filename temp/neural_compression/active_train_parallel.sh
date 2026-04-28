@@ -22,14 +22,16 @@ FRAMES_PER_RUN=750    # Frames per simulation
 MASS_LOSS_START_CYCLE=2
 MASS_LOSS_WEIGHT=2.5
 FLUID_LOSS_WEIGHT=35.0 # Increased to combat Zero-baseline drift
-NOISE_STD=0.01        # Increased to improve error-correction robustness
-AR_STEPS=10           # Increased target for 100-frame rollout
-AR_START_CYCLE=2       # Cycle to begin curriculum
-AR_INCREMENT_INTERVAL=3 # Give model 3 cycles to adapt to step increases
+NOISE_STD=0.01        # Gaussian noise injected into inputs to improve drift stability
+AR_STEPS=5            # Target sequence length for rollout training
+AR_START_CYCLE=2      # Cycle to begin multi-step curriculum
+AR_INCREMENT_INTERVAL=3 # Cycles to wait between increasing sequence length
+SKIP_INITIAL=5        # Sparsely sample frames during initialization to speed up early cycles
+USE_8BIT_ADAM=1       # Set to 1 to use BitsAndBytes 8-bit AdamW for VRAM savings
 
 # --- Unique Run Setup ---
 # Use first argument as RUN_NAME if provided, otherwise generate a unique one
-RUN_NAME="run_20260421_032656"
+RUN_NAME=${1:-run_$(date +%Y%m%d_%H%M%S)}
 DATA_DIR="data/$RUN_NAME"
 LOG_DIR="logs/$RUN_NAME"
 ATTEMPTS_DIR="attempts/$RUN_NAME"
@@ -56,13 +58,13 @@ for i in $(seq 1 $ITERATIONS); do
     echo "----------------------------------------"
 
     # 0. DYNAMIC EPOCH CALCULATION
-    # Optimized for fast iteration in Active Learning
-    if [ $i -lt 10 ]; then
-        CURRENT_EPOCHS=1
-    elif [ $i -lt 20 ]; then
-        CURRENT_EPOCHS=2
+    # Increased epochs to allow better convergence with Spectral Normalization constraints
+    if [ $i -lt 5 ]; then
+        CURRENT_EPOCHS=5   # Fast initial adaptation
+    elif [ $i -lt 15 ]; then
+        CURRENT_EPOCHS=10  # Deepen learning as dataset grows
     else
-        CURRENT_EPOCHS=3
+        CURRENT_EPOCHS=20  # Fine-tuning on large cumulative data
     fi
 
     # 1. GENERATE DATA (Throttled Parallel execution)
@@ -84,14 +86,13 @@ for i in $(seq 1 $ITERATIONS); do
 
     # 2. STORAGE CLEANUP (Rolling Buffer - Run Specific)
     echo "Cleaning up old simulation data in $DATA_DIR (keeping top $MAX_SESSIONS)..."
-    ls -1dt "$DATA_DIR"/*/ | tail -n +$((MAX_SESSIONS + 1)) | xargs -r rm -rf
+    ls -dt "$DATA_DIR"/*/ | tail -n +$((MAX_SESSIONS + 1)) | xargs -r rm -rf
 
     # 3. TRAIN ON REMAINING DATA
     echo "Starting training session with $CURRENT_EPOCHS epochs..."
     ./env/bin/python compressor.py \
         --cycle $i \
         --epochs $CURRENT_EPOCHS \
-        --skip_frames 5 \
         --data_dir "$DATA_DIR" \
         --output_dir "$ATTEMPTS_DIR" \
         --model_name "best_model.pth" \
@@ -100,10 +101,13 @@ for i in $(seq 1 $ITERATIONS); do
         --fluid_weight $FLUID_LOSS_WEIGHT \
         --batch_size 0 \
         --effective_batch_size 8 \
-        --noise_std $NOISE_STD \
-        --ar_steps $AR_STEPS \
+        --skip_frames 5 \
+        --n_steps $AR_STEPS \
         --ar_start_cycle $AR_START_CYCLE \
         --ar_increment_interval $AR_INCREMENT_INTERVAL \
+        --noise_std $NOISE_STD \
+        --skip_initial $SKIP_INITIAL \
+        --use_8bit_adam \
         --bf16
      
     echo "Cycle $i complete."
