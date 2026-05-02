@@ -21,10 +21,12 @@ BUFFER_WIDTH = 400
 BUFFER_HEIGHT = 400
 
 # Normalization factors
-DENSITY_NORM = 50.0 # Maps 0.02 max to 1.0
+DENSITY_NORM = 50.0 # Maps 0.02 max to 1.0 #cursed
 VELOCITY_NORM = 1.0 / 7.5 # Maps 7.5 max to 1.0
 LATENT_DIM = 1024
-# Activation Configuration
+# Activation Configuration\
+# Note: Try sigmoid & tanh, I lowkey think they will owkr better than any of these
+# I think relu (and varients) loos too much data 
 ACTIVATION_TYPE = "SiLU"
 ACTIVATION_LOOKUP = {
     "ReLU": nn.ReLU,
@@ -191,6 +193,7 @@ class Encoder(nn.Module):
         return self.fc(self.conv(x))
 
 class Decoder(nn.Module):
+    # I lowkey just vibe coded parts of this for the sake of my brain energy
     def __init__(self, latent_dim=1024):
         super().__init__()
         # Bottleneck mapping
@@ -224,12 +227,11 @@ class Decoder(nn.Module):
         
         self.final_act = nn.Sigmoid()
 
+    #check pointing like hell so it stops crashing mid run
+    # might highkey just move to cpu training 
     def forward(self, z, prev_d, mask, coords):
-        # 1. Map bottleneck to 50x50
         x = self.fc(z).view(-1, 128, 50, 50)
         
-        # 2. Extract Context "Blueprints" from Previous Frame + Mask + Coords
-        # We can checkpoint context extraction to save memory on skip connections
         def get_context(pd, mk, cr):
             c400 = self.context_400(torch.cat([pd, mk, cr], dim=1))
             c200 = self.context_200(c400)
@@ -242,8 +244,6 @@ class Decoder(nn.Module):
         else:
             ctx_400, ctx_200, ctx_100, ctx_50 = get_context(prev_d, mask, coords)
         
-        # 3. Upsample while injecting high-res context at each step
-        # Use checkpoint for each major upsampling stage
         def stage1(feat, ctx): return self.up_50_to_100(torch.cat([feat, ctx], dim=1))
         def stage2(feat, ctx): return self.up_100_to_200(torch.cat([feat, ctx], dim=1))
         def stage3(feat, ctx): return self.up_200_to_400(torch.cat([feat, ctx], dim=1))
@@ -340,7 +340,7 @@ def find_max_batch_size(model, device, n_steps=1, is_bf16=False):
     print(f"Max batch size found: {found_batch}")
     torch.cuda.empty_cache()
     gc.collect()
-    return found_batch
+    return int(found_batch*0.5) # god dam, even 75% causes it to crash 
 
 def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_filename="best_model.pth", fluid_weight=50.0, mass_loss_weight=0.0, args=None):
     # Determine effective mass loss weight based on curriculum
@@ -495,16 +495,13 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
     def hybrid_loss(input, target, f_weight=fluid_weight, m_weight=effective_mass_weight, grad_weight=15.0):
-        # Create mask for fluid vs background
         fluid_mask = (target > 0.05).float()
         background_mask = 1.0 - fluid_mask
 
-        # Calculate MSE for both regions separately
         mse_fluid = torch.sum(fluid_mask * (input - target) ** 2) / (fluid_mask.sum() + 1e-6)
         mse_bg = torch.sum(background_mask * (input - target) ** 2) / (background_mask.sum() + 1e-6)
         mse_total = (f_weight * mse_fluid) + mse_bg
 
-        # Grad Consistency Term: Forces the model to match sharp edges
         in_dx = input[:, :, 1:, :] - input[:, :, :-1, :]
         in_dy = input[:, :, :, 1:] - input[:, :, :, :-1]
         tg_dx = target[:, :, 1:, :] - target[:, :, :-1, :]
@@ -517,7 +514,9 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
 
         total_loss = mse_total + (grad_weight * grad_loss)
 
-        # Global Mass Conservation (Normalized to Mean to match MSE scale)
+        # I dont think this is right ngl
+        # esp cause of how rasterisation works, this can be a bit sketch
+
         if m_weight > 0:
             mass_input = torch.mean(input, dim=(1, 2, 3))
             mass_target = torch.mean(target, dim=(1, 2, 3))
