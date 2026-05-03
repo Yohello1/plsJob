@@ -219,7 +219,15 @@ int main(int argc, char** argv) {
         frame_num++;
 
         // Log the frame data to sim_data.bin
-        JD::logging::log(frame_num);
+        JD::logging::log(frame_num,
+                         JD::graphics::offsets,
+                         JD::graphics::cells_ctr,
+                         JD::graphics::particles_loc,
+                         JD::floaters::BLOCK_NEIGHBOR_COUNT,
+                         JD::floaters::blocks,
+                         JD::floaters::floatersA,
+                         PARTICLE_SIZE,
+                         JD::sycl::compute_queue);
 
         if (max_frames > 0 && frame_num >= max_frames) {
             quit = true;

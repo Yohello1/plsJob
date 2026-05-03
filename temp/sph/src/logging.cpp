@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <cstdlib>
 #include <cstring>
+#include <sycl/sycl.hpp>
 
 namespace JD::logging
 {
@@ -51,8 +52,19 @@ namespace JD::logging
 
         _log_file.open(_logging_dir + "/sim_data.bin", std::ios::binary);
     }
-    
-    void log(size_t i)
+   
+    // aint no way Im passing in the same data which I do for the 
+    // simulation functions...
+    // FOR A LOGGING FUNCTION
+    void log(size_t i,
+             int* offsets_in,
+             int* cells_ctr_in,
+             int* particles_loc_in, 
+             int region_amt, 
+             JD::floaters::block* blocks_in,
+             floaters_soa particles_in,
+             float h_in, 
+             ::sycl::queue& q)
     {
         if (!_log_file.is_open()) return;
 
@@ -75,7 +87,7 @@ namespace JD::logging
             if (px >= 0 && px < N_W && py >= 0 && py < N_H) {
                 int idx = py * N_W + px;
                 if (f.enabled[p_idx]) {
-                    sum_d[idx] += f.density[p_idx];
+                    // sum_d[idx] += f.density[p_idx];
                     sum_vx[idx] += f.v_x[p_idx];
                     sum_vy[idx] += f.v_y[p_idx];
                     count[idx]++;
@@ -83,6 +95,49 @@ namespace JD::logging
                 
                 if (p_idx >= DESIRED_FLOATERS) {
                     mask[idx] = 1;
+                }
+            }
+        }
+
+        // In going to cry when writting the density summation part lol
+        // as much as I want to just use the m^2*n algo to solve this (triple for loops)
+        // that shit gonna take 8,000,000,000 operations...
+        // so optimised path we go!
+
+        // we can stick it onto the gpu (sycl) later lol
+        // linear hat function = -|x| + 1 {-1 <= x <= 1, else 0}
+
+        // double for loop for all parts, convert to block index and sample particles around 
+        // area... how did I do the thingy again, if I reverse order I can save time
+        // anyways
+
+        for(int j = 0; j < BUFFER_HEIGHT; j++)
+        {
+            for(int i = 0; i < BUFFER_WIDTH; i++)
+            {
+                int bx = (int) (i / DISTANCE_BETWEEN_POINTS);
+                int by = (int) (j / DISTANCE_BETWEEN_POINTS);
+                int idx_d = j * BUFFER_WIDTH + i;
+
+                size_t idx = (size_t)(bx + by * BUFFER_LINE);
+
+                for (int r = 0; r < region_amt; r++) 
+                {
+                    int idx_r = (int)blocks_in[idx].regions[r];
+                    if (idx_r == INT_MAX) continue;
+
+                    int idx_o = offsets_in[idx_r];
+                    for (int k = 0; k < cells_ctr_in[idx_r]; k++) 
+                    {
+                        int floater_idx = particles_loc_in[idx_o + k];
+                        float dx = particles_in.x[floater_idx] - i;
+                        float dy = particles_in.y[floater_idx] - j;
+                        float dist = std::fabs(std::sqrt(dx*dx + dy*dy));
+                
+                        float kernel_func = (dist <= 1.0f) ? (1.0f - dist) : 0.0f;
+
+                        sum_d[idx_d] += kernel_func;
+                    }
                 }
             }
         }
@@ -95,7 +150,7 @@ namespace JD::logging
         };
 
         // Order: Density, V_x, V_y, Mask
-        write_chunk([&](int idx) { return count[idx] > 0 ? sum_d[idx] / count[idx] : 0.0f; });
+        write_chunk([&](int idx) { return sum_d[idx]; });
         write_chunk([&](int idx) { return count[idx] > 0 ? sum_vx[idx] / count[idx] : 0.0f; });
         write_chunk([&](int idx) { return count[idx] > 0 ? sum_vy[idx] / count[idx] : 0.0f; });
         write_chunk([&](int idx) { return static_cast<float>(mask[idx]); });
