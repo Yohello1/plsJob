@@ -76,7 +76,7 @@ class SPHDataset(Dataset):
         self.frame_size = 4 * BUFFER_WIDTH * BUFFER_HEIGHT * 4 # 4 fields * N * 4 bytes
         self.field_size = BUFFER_WIDTH * BUFFER_HEIGHT * 4
         self.order = {"d": 0, "v_x": 1, "v_y": 2, "m": 3}
-        self.handles = {} # Local handle cache to avoid NFS re-opening
+        self.handles = {}
         self.density_norm = 1.0
         self.velocity_norm = 1.0
 
@@ -446,19 +446,6 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     # Initialize model
     model = FullModel(LATENT_DIM_LOCAL).to(device)
     
-    # NEW: LOAD PERSISTENT WEIGHTS
-    # This allows Active Learning to actually "build" on previous cycles
-    pretrained_path = os.path.join(output_dir, model_filename)
-    if os.path.exists(pretrained_path):
-        try:
-            print(f"Loading existing weights from {pretrained_path} (Incremental Learning)...")
-            state_dict = torch.load(pretrained_path, map_location=device, weights_only=True)
-            model.load_state_dict(state_dict)
-        except Exception as e:
-            print(f"Warning: Could not load pretrained weights ({e}). Starting from scratch.")
-    else:
-        print("No previous model found. Starting training from random initialization.")
-    
     # Precision Control: BF16 saves ~2.4GB on weights/grads for this model
     is_bf16 = args.bf16 if args and hasattr(args, 'bf16') else False
     if is_bf16 and torch.cuda.is_bf16_supported():
@@ -470,6 +457,24 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         print("Enabled BFloat16 Precision (Norm layers kept in Float32 for stability)")
     else:
         is_bf16 = False
+
+    # 3. Load Persistent Weights (Incremental Learning)
+    # Optimized: Load to CPU first and apply after precision conversion to save VRAM
+    pretrained_path = os.path.join(output_dir, model_filename)
+    if os.path.exists(pretrained_path):
+        try:
+            print(f"Loading existing weights from {pretrained_path} (CPU -> GPU Transfer)...")
+            # Load to CPU to avoid peak memory spike on GPU
+            state_dict = torch.load(pretrained_path, map_location='cpu', weights_only=True)
+            # If the model is in BF16, we can convert the state_dict before moving to GPU
+            if is_bf16:
+                state_dict = {k: v.to(torch.bfloat16) for k, v in state_dict.items()}
+            model.load_state_dict(state_dict)
+            del state_dict # Force cleanup
+        except Exception as e:
+            print(f"Warning: Could not load pretrained weights ({e}). Starting from scratch.")
+    else:
+        print("No previous model found. Starting training from random initialization.")
     
     model_depth = model.get_depth()
     print(f"Model Depth: {model_depth} convolutional layers.")
