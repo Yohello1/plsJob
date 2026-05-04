@@ -89,6 +89,8 @@ def main():
     parser.add_argument("--skip_initial", type=int, default=DEFAULT_SKIP_INITIAL)
     parser.add_argument("--use_8bit_adam", action="store_true", default=True, help="Use BitsAndBytes 8-bit AdamW optimizer")
     parser.add_argument("--no_build", action="store_true", help="Skip building fluid sim")
+    parser.add_argument("--start_cycle", type=int, default=1, help="Cycle to start from (useful for resuming)")
+    parser.add_argument("--skip_sim", action="store_true", help="Skip the simulation data generation phase")
     args = parser.parse_args()
 
     # --- Setup Environment ---
@@ -127,7 +129,7 @@ def main():
     print(f"Starting Parallel Active Learning Loop for {run_name}...")
 
     # --- Main Active Learning Loop ---
-    for i in range(1, args.iterations + 1):
+    for i in range(args.start_cycle, args.iterations + 1):
         print("----------------------------------------")
         print(f" Cycle {i} of {args.iterations} (Run: {run_name})")
         print("----------------------------------------")
@@ -141,8 +143,11 @@ def main():
             current_epochs = 20
 
         # 1. Generate Data
-        run_simulations(i, run_name, args.runs_per_iteration, args.max_parallel, 
-                        args.frames_per_run, data_dir, log_dir)
+        if not args.skip_sim:
+            run_simulations(i, run_name, args.runs_per_iteration, args.max_parallel, 
+                            args.frames_per_run, data_dir, log_dir)
+        else:
+            print(f"Skipping simulation phase for cycle {i} as requested.")
 
         # 2. Storage Cleanup
         cleanup_storage(data_dir, args.max_sessions)

@@ -182,7 +182,12 @@ class Encoder(nn.Module):
         self.fc = nn.Linear(128 * 50 * 50, latent_dim)
 
     def forward(self, x):
-        return self.fc(self.conv(x))
+        if self.training:
+            # Checkpoint the convolutional backbone to save ~400MB of activations
+            x = checkpoint(self.conv, x, use_reentrant=False)
+        else:
+            x = self.conv(x)
+        return self.fc(x)
 
 class Decoder(nn.Module):
     # I lowkey just vibe coded parts of this for the sake of my brain energy
@@ -263,8 +268,11 @@ class FullModel(nn.Module):
             p_v = p_v + torch.randn_like(p_v) * noise_std
 
         coords = get_coord_grid(p_d.size(0), BUFFER_HEIGHT, BUFFER_WIDTH, p_d.device).to(p_d.dtype)
+        
         # 9 channels: p_d(1), p_v(2), c_d(1), c_v(2), mask(1), coords(2)
-        z = self.encoder(torch.cat([p_d, p_v, c_d, c_v, mask, coords], dim=1))
+        # We cat everything here; checkpointing the passes below will handle the rest
+        x = torch.cat([p_d, p_v, c_d, c_v, mask, coords], dim=1)
+        z = self.encoder(x)
         return self.decoder(z, p_d, mask, coords)
 
     def get_depth(self):
