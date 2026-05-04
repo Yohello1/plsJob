@@ -72,7 +72,8 @@ namespace JD::logging
         const int N_W = BUFFER_WIDTH;
         const int N_H = BUFFER_HEIGHT;
 
-        std::vector<float> sum_d(N_W * N_H, 0.0f);
+        float* sum_d = sycl::malloc_shared<float>(N_W * N_H, q);
+        q.fill(sum_d, 0.0f, N_W * N_H).wait();
         std::vector<float> sum_vx(N_W * N_H, 0.0f);
         std::vector<float> sum_vy(N_W * N_H, 0.0f);
         std::vector<int> count(N_W * N_H, 0);
@@ -111,10 +112,11 @@ namespace JD::logging
         // area... how did I do the thingy again, if I reverse order I can save time
         // anyways
 
-        for(int j = 0; j < BUFFER_HEIGHT; j++)
-        {
-            for(int i = 0; i < BUFFER_WIDTH; i++)
+            q.parallel_for(sycl::range<2>(BUFFER_HEIGHT, BUFFER_WIDTH), [=](sycl::id<2> idx_id)
             {
+                int i = idx_id[1];
+                int j = idx_id[0];
+
                 int bx = (int) (i / DISTANCE_BETWEEN_POINTS);
                 int by = (int) (j / DISTANCE_BETWEEN_POINTS);
                 int idx_d = j * BUFFER_WIDTH + i;
@@ -132,15 +134,14 @@ namespace JD::logging
                         int floater_idx = particles_loc_in[idx_o + k];
                         float dx = particles_in.x[floater_idx] - i;
                         float dy = particles_in.y[floater_idx] - j;
-                        float dist = std::fabs(std::sqrt(dx*dx + dy*dy));
+                        float dist = sycl::fabs(sycl::sqrt(dx*dx + dy*dy));
                 
                         float kernel_func = (dist <= 1.0f) ? (1.0f - dist) : 0.0f;
 
                         sum_d[idx_d] += kernel_func;
                     }
                 }
-            }
-        }
+            }).wait();
 
         auto write_chunk = [&](auto get_val) {
             for (int j = 0; j < N_H * N_W; ++j) {
@@ -156,6 +157,7 @@ namespace JD::logging
         write_chunk([&](int idx) { return static_cast<float>(mask[idx]); });
 
         _log_file.flush();
+        sycl::free(sum_d, q);
     }
 
     void finish()

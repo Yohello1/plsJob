@@ -87,7 +87,7 @@ def main():
     parser.add_argument("--ar_start_cycle", type=int, default=DEFAULT_AR_START_CYCLE)
     parser.add_argument("--ar_increment_interval", type=int, default=DEFAULT_AR_INCREMENT_INTERVAL)
     parser.add_argument("--skip_initial", type=int, default=DEFAULT_SKIP_INITIAL)
-    parser.add_argument("--use_8bit_adam", action="store_true", default=DEFAULT_USE_8BIT_ADAM)
+    parser.add_argument("--use_8bit_adam", action="store_true", default=True, help="Use BitsAndBytes 8-bit AdamW optimizer")
     parser.add_argument("--no_build", action="store_true", help="Skip building fluid sim")
     args = parser.parse_args()
 

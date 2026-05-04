@@ -20,9 +20,9 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 BUFFER_WIDTH = 400
 BUFFER_HEIGHT = 400
 
-# Normalization factors
-DENSITY_NORM = 50.0 # Maps 0.02 max to 1.0 #cursed
-VELOCITY_NORM = 1.0 / 7.5 # Maps 7.5 max to 1.0
+# Normalization factors (default)
+DENSITY_NORM = 1.0 / 0.02 
+VELOCITY_NORM = 1.0 / 7.5 
 LATENT_DIM = 1024
 # Activation Configuration\
 # Note: Try sigmoid & tanh, I lowkey think they will owkr better than any of these
@@ -76,7 +76,9 @@ class SPHDataset(Dataset):
         self.frame_size = 4 * BUFFER_WIDTH * BUFFER_HEIGHT * 4 # 4 fields * N * 4 bytes
         self.field_size = BUFFER_WIDTH * BUFFER_HEIGHT * 4
         self.order = {"d": 0, "v_x": 1, "v_y": 2, "m": 3}
-        self.handles = {} # I was told this improves nfs perf 
+        self.handles = {} # Local handle cache to avoid NFS re-opening
+        self.density_norm = 1.0
+        self.velocity_norm = 1.0
 
         for d_dir in self.data_dirs:
             bin_file = os.path.join(d_dir, "sim_data.bin")
@@ -91,6 +93,10 @@ class SPHDataset(Dataset):
         
         if skip_initial > 1:
             self.samples = self.samples[::skip_initial]
+
+    def set_norms(self, d_norm, v_norm):
+        self.density_norm = d_norm
+        self.velocity_norm = v_norm
 
     # literally half of this was to handle the shitty hardware Im on
     def _get_handle(self, data_dir):
@@ -107,6 +113,7 @@ class SPHDataset(Dataset):
         raw_data = np.fromfile(handle, dtype=np.float32, count=4 * BUFFER_WIDTH * BUFFER_HEIGHT)
         raw_data = raw_data.reshape((4, BUFFER_HEIGHT, BUFFER_WIDTH))
         
+        # Unpack fields (no more multiple seeks!)
         d = torch.from_numpy(raw_data[0]).unsqueeze(0)
         v = torch.from_numpy(raw_data[1:3]) # v_x, v_y
         m = torch.from_numpy(raw_data[3]).unsqueeze(0)
@@ -116,32 +123,15 @@ class SPHDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def load_bin(self, data_dir, frame_idx, suffix, dtype=np.float32):
-        field_offset = self.order[suffix] * self.field_size
-        offset = frame_idx * self.frame_size + field_offset
-        
-        path = os.path.join(data_dir, "sim_data.bin")
-        with open(path, "rb") as f:
-            f.seek(offset)
-            data = np.fromfile(f, dtype=dtype, count=BUFFER_WIDTH * BUFFER_HEIGHT)
-            
-        data = data.reshape((BUFFER_HEIGHT, BUFFER_WIDTH))
-        tensor = torch.tensor(data, dtype=torch.float32).unsqueeze(0)
-        
-        # noramlisation!!!! 
-        if suffix == "d":
-            return tensor * DENSITY_NORM
-        elif suffix.startswith("v"):
-            return tensor * VELOCITY_NORM
-        return tensor
-
     # The last data bender did some data bending (augmentation)
     def __getitem__(self, idx):
         data_dir, start_idx = self.samples[idx]
         
+        # Load Sequence Data
         frames_d = []
         frames_v = []
         
+        # Random Physical Symmetry Flips (Data Augmentation)
         flip_h = random.random() > 0.5
         flip_v = random.random() > 0.5
         
@@ -149,18 +139,20 @@ class SPHDataset(Dataset):
             f_idx = start_idx + step * self.skip
             d, v, m = self.load_frame_data(data_dir, f_idx)
             
-            d = d * DENSITY_NORM
-            v = v * VELOCITY_NORM
+            # Normalization
+            d = d * self.density_norm
+            v = v * self.velocity_norm
             
+            # Apply physical symmetry with velocity correction
             if flip_h:
                 d = torch.flip(d, [-1])
                 v = torch.flip(v, [-1])
-                v[0] *= -1.0
+                v[0] *= -1.0 # Negate X-velocity for horizontal flip
                 m = torch.flip(m, [-1])
             if flip_v:
                 d = torch.flip(d, [-2])
                 v = torch.flip(v, [-2])
-                v[1] *= -1.0
+                v[1] *= -1.0 # Negate Y-velocity for vertical flip
                 m = torch.flip(m, [-2])
             
             frames_d.append(d)
@@ -221,8 +213,8 @@ class Decoder(nn.Module):
         )
         # 200x200 Stage
         self.up_200_to_400 = nn.Sequential(
-            nn.Conv2d(64 + 32, 12, 3, padding=1),   # 3 output channels (Density + Velocity) * 2^2
-            nn.PixelShuffle(2)                       # Output: 3 channels, 400x400
+            nn.Conv2d(64 + 32, 4, 3, padding=1),   # 1 output channel (Density) * 2^2
+            nn.PixelShuffle(2)                       # Output: 1 channel, 400x400
         )
         
         self.final_act = nn.Sigmoid()
@@ -340,7 +332,44 @@ def find_max_batch_size(model, device, n_steps=1, is_bf16=False):
     print(f"Max batch size found: {found_batch}")
     torch.cuda.empty_cache()
     gc.collect()
-    return int(found_batch*0.5) # god dam, even 75% causes it to crash 
+    return found_batch
+
+def get_global_stats(data_dirs):
+    """Scans all binary files to find the maximum density for normalization."""
+    print("Scanning dataset for global normalization factors...")
+    max_density = 1e-6
+    max_velocity = 1e-6
+    
+    for d_dir in data_dirs:
+        bin_file = os.path.join(d_dir, "sim_data.bin")
+        if not os.path.exists(bin_file):
+            continue
+            
+        try:
+            # Use memory mapping for high-speed scanning without loading into RAM
+            m = np.memmap(bin_file, dtype=np.float32, mode='r')
+            # Each frame is 4 fields of BUFFER_WIDTH * BUFFER_HEIGHT
+            frame_elements = 4 * BUFFER_WIDTH * BUFFER_HEIGHT
+            num_frames = m.size // frame_elements
+            if num_frames == 0:
+                continue
+                
+            m = m[:num_frames * frame_elements].reshape(-1, 4, BUFFER_HEIGHT, BUFFER_WIDTH)
+            
+            # Density is the first field (index 0)
+            local_max_d = m[:, 0, :, :].max()
+            max_density = max(max_density, local_max_d)
+            
+            # Velocity fields are index 1 and 2
+            local_max_v = np.abs(m[:, 1:3, :, :]).max()
+            max_velocity = max(max_velocity, local_max_v)
+            
+            del m # Close the memory map
+        except Exception as e:
+            print(f"Warning: Could not scan {bin_file} ({e})")
+            
+    print(f"Scan complete. Max Density: {max_density:.4f}, Max Velocity: {max_velocity:.4f}")
+    return max_density, max_velocity
 
 def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_filename="best_model.pth", fluid_weight=50.0, mass_loss_weight=0.0, args=None):
     # Determine effective mass loss weight based on curriculum
@@ -400,8 +429,18 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     
     print(f"Curriculum: n_steps = {current_n_steps} (Limit: {n_steps_limit}, Cycle: {current_cycle})")
 
+    # Calculate global normalization factors
+    max_d, max_v = get_global_stats(session_dirs)
+    density_norm = 1.0 / max_d
+    velocity_norm = 1.0 / max_v
+    print(f"Normalization: Density Scale={density_norm:.6f}, Velocity Scale={velocity_norm:.6f}")
+
     train_dataset = SPHDataset(train_dirs, skip=args.skip_frames if args else 10, n_steps=current_n_steps, skip_initial=args.skip_initial if args else 1)
     val_dataset = SPHDataset(val_dirs, skip=args.skip_frames if args else 10, n_steps=current_n_steps)
+    
+    train_dataset.set_norms(density_norm, velocity_norm)
+    val_dataset.set_norms(density_norm, velocity_norm)
+    
     skip_val = train_dataset.skip
 
     # Initialize model
@@ -450,7 +489,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         f.write(f"Epochs per Cycle: {epochs}\n")
         f.write(f"Train/Val Split: {len(train_dirs)}/{len(val_dirs)}\n")
         f.write(f"Loss Function: WeightedMSE (Fluid Weight: {fluid_weight})\n")
-        f.write(f"Normalizations: Density={DENSITY_NORM}, Velocity={VELOCITY_NORM}\n")
+        f.write(f"Normalizations: Density={density_norm}, Velocity={velocity_norm}\n")
         f.write(f"Cycle: {current_cycle}\n")
         f.write(f"Mass Loss Weight (Target): {mass_loss_weight}\n")
         f.write(f"Mass Loss Start Cycle: {start_cycle}\n")
@@ -567,19 +606,18 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
                     else:
                         output = model(p_d, p_v, curr_d_gt, curr_v_gt, mask, noise_std=noise_std)
                         
-                    pred_d = output[:, 0:1]
-                    pred_v = output[:, 1:3]
+                    pred_d = output # Now 1 channel (Density)
                     
                     # Density Loss (Hybrid)
-                    loss_d = criterion(pred_d.to(torch.float32), curr_d_gt.to(torch.float32))
-                    # Velocity Loss (Simple MSE)
-                    loss_v = torch.mean((pred_v.to(torch.float32) - curr_v_gt.to(torch.float32))**2)
-                    
-                    batch_loss += (loss_d + 10.0 * loss_v) # Velocity weight 10x
+                    loss = criterion(pred_d.to(torch.float32), curr_d_gt.to(torch.float32))
+                    batch_loss += loss
                     
                     # Update for next step in rollout (AR)
                     p_d = pred_d
-                    p_v = pred_v
+                    # Since we don't predict velocity, we use the next step's GT velocity as input 
+                    # for the next encoder pass in the sequence
+                    if step + 1 < current_n_steps:
+                        p_v = c_vs[:, step] 
                 
                 loss = batch_loss / (current_n_steps * accumulation_steps)
                 
@@ -632,7 +670,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
                     curr_d_gt = c_ds[:, 0]
                     curr_v_gt = c_vs[:, 0]
                     output = model(p_d, p_v, curr_d_gt, curr_v_gt, mask)
-                    pred_d = output[:, 0:1]
+                    pred_d = output
                     
                     total_val_loss += criterion(pred_d.float(), curr_d_gt.float()).item()
                     total_val_zero += criterion(torch.zeros_like(curr_d_gt).float(), curr_d_gt.float()).item()
@@ -688,7 +726,7 @@ if __name__ == "__main__":
     parser.add_argument("--ar_increment_interval", type=int, default=3, help="How many cycles to wait between increasing AR step count")
     parser.add_argument("--noise_std", type=float, default=0.0, help="Standard deviation of Gaussian noise injected into inputs during training")
     parser.add_argument("--skip_initial", type=int, default=1, help="If > 1, sparsely samples frames during initialization to speed up cycles")
-    parser.add_argument("--use_8bit_adam", action="store_true", help="Use BitsAndBytes 8-bit AdamW optimizer for VRAM savings")
+    parser.add_argument("--use_8bit_adam", action="store_true", default=True, help="Use BitsAndBytes 8-bit AdamW optimizer for VRAM savings")
     args = parser.parse_args()
     train(args.epochs, args.data_dir, args.output_dir, args.model_name, args.fluid_weight, args.mass_loss_weight, args)
 

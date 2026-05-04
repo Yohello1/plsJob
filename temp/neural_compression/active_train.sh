@@ -60,7 +60,8 @@ for i in $(seq 1 $ITERATIONS); do
         --mass_loss_start_cycle $MASS_LOSS_START_CYCLE \
         --batch_size 0 \
         --effective_batch_size 8 \
-        --bf16
+        --bf16 \
+        --use_8bit_adam
     
     echo "Cycle $i complete. Best model checkpoint updated in $ATTEMPTS_DIR."
 done
