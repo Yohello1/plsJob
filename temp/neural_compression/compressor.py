@@ -606,7 +606,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
 
             with torch.amp.autocast('cuda', dtype=torch.bfloat16 if is_bf16 else torch.float16):
                 # Autoregressive Rollout Loop
-                batch_loss = 0
+                total_step_loss = 0
                 noise_std = getattr(args, 'noise_std', 0.0)
                 
                 for step in range(current_n_steps):
@@ -622,22 +622,27 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
                     pred_d = output # Now 1 channel (Density)
                     
                     # Density Loss (Hybrid)
-                    loss = criterion(pred_d.to(torch.float32), curr_d_gt.to(torch.float32))
-                    batch_loss += loss
+                    # Note: Divide by current_n_steps * accumulation_steps for correct averaging
+                    step_loss = criterion(pred_d.to(torch.float32), curr_d_gt.to(torch.float32)) / (current_n_steps * accumulation_steps)
+                    
+                    # TBPTT: Backward per step to keep graph shallow and VRAM constant
+                    if scaler:
+                        scaler.scale(step_loss).backward()
+                    else:
+                        step_loss.backward()
+                        
+                    total_step_loss += step_loss.item()
                     
                     # Update for next step in rollout (AR)
-                    p_d = pred_d
+                    # DETACH is the key here: it prevents the graph from growing linearly with N
+                    p_d = pred_d.detach()
+                    
                     # Since we don't predict velocity, we use the next step's GT velocity as input 
-                    # for the next encoder pass in the sequence
                     if step + 1 < current_n_steps:
-                        p_v = c_vs[:, step] 
+                        p_v = c_vs[:, step].detach() 
                 
-                loss = batch_loss / (current_n_steps * accumulation_steps)
-                
-            if scaler:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
+                loss_val = total_step_loss # For logging usage below
+                loss = None # Placeholder to avoid accidental reuse
             
             if (i + 1) % accumulation_steps == 0:
                 if scaler:
@@ -647,7 +652,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 
-            total_train_loss += (loss.item() * accumulation_steps * current_n_steps)
+            total_train_loss += (loss_val * accumulation_steps * current_n_steps)
             total_train_var += torch.var(pred_d).item()
             
             # Periodically Clear Fragments
