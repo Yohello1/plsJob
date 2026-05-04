@@ -672,10 +672,12 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         # --- VALIDATION LOOP ---
         model.eval()
         total_val_loss = 0
+        total_val_loss_steps = [0.0] * current_n_steps
         total_val_zero = 0
         total_val_ident = 0
         total_val_var = 0
         total_val_gt_var = 0
+        
         with torch.no_grad():
             for p_d, p_v, c_ds, c_vs, mask in val_loader:
                 p_d, p_v, c_ds, c_vs, mask = p_d.to(device), p_v.to(device), c_ds.to(device), c_vs.to(device), mask.to(device)
@@ -684,17 +686,35 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
                    p_d, p_v, c_ds, c_vs, mask = p_d.to(torch.bfloat16), p_v.to(torch.bfloat16), c_ds.to(torch.bfloat16), c_vs.to(torch.bfloat16), mask.to(torch.bfloat16)
                 
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16 if is_bf16 else torch.float16):
-                    # Validation only on the first step for baseline consistency
-                    curr_d_gt = c_ds[:, 0]
-                    curr_v_gt = c_vs[:, 0]
-                    output = model(p_d, p_v, curr_d_gt, curr_v_gt, mask)
-                    pred_d = output
+                    # Initial state for Ident baseline (Step 0)
+                    p_d_init = p_d.clone()
                     
-                    total_val_loss += criterion(pred_d.float(), curr_d_gt.float()).item()
-                    total_val_zero += criterion(torch.zeros_like(curr_d_gt).float(), curr_d_gt.float()).item()
-                    total_val_ident += criterion(p_d.float(), curr_d_gt.float()).item()
+                    # Full Rollout Validation
+                    batch_total_val = 0
+                    for step in range(current_n_steps):
+                        curr_d_gt = c_ds[:, step]
+                        curr_v_gt = c_vs[:, step]
+                        
+                        output = model(p_d, p_v, curr_d_gt, curr_v_gt, mask)
+                        pred_d = output
+                        
+                        step_loss = criterion(pred_d.float(), curr_d_gt.float()).item()
+                        total_val_loss_steps[step] += step_loss
+                        batch_total_val += step_loss
+                        
+                        # Prepare for next step (AR Rollout)
+                        p_d = pred_d.detach()
+                        if step + 1 < current_n_steps:
+                            p_v = c_vs[:, step].detach()
+                    
+                    total_val_loss += (batch_total_val / current_n_steps)
+                    
+                    # Baselines calculated on the first step for reference
+                    curr_d_gt_0 = c_ds[:, 0]
+                    total_val_zero += criterion(torch.zeros_like(curr_d_gt_0).float(), curr_d_gt_0.float()).item()
+                    total_val_ident += criterion(p_d_init.float(), curr_d_gt_0.float()).item()
                     total_val_var += torch.var(pred_d.float()).item()
-                    total_val_gt_var += torch.var(curr_d_gt.float()).item()
+                    total_val_gt_var += torch.var(curr_d_gt_0.float()).item()
                 
                 torch.cuda.empty_cache()
 
@@ -707,11 +727,16 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         avg_val_var = total_val_var / len(val_loader)
         avg_val_gt_var = total_val_gt_var / len(val_loader)
         
+        # Calculate per-step averages
+        avg_val_steps = [s / len(val_loader) for s in total_val_loss_steps]
+        step_error_str = ", ".join([f"S{i+1}: {err:.4f}" for i, err in enumerate(avg_val_steps)])
+        
         # Step the scheduler
         scheduler.step(avg_val_loss)
         
         print(f"Epoch {epoch+1}/{epochs}")
         print(f"    Train Loss: {avg_train_loss:.8f} | Val Loss: {avg_val_loss:.8f}")
+        print(f"    Val Step Errors: [{step_error_str}]")
         print(f"    Val Baselines: [Zero: {avg_val_zero:.8f}, Ident: {avg_val_ident:.8f}]")
         print(f"    Variance: [Train: {avg_train_var:.8f}, Val: {avg_val_var:.8f}, Val_GT: {avg_val_gt_var:.8f}]")
         print(f"    Val Max: [Pred: {pred_d.max().item():.4f}, GT: {curr_d_gt.max().item():.4f}]")
