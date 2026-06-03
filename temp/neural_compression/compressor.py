@@ -8,7 +8,7 @@ import glob
 import sys
 import random
 import gc
-from torch.utils.checkpoint import checkpoint
+
 try:
     import bitsandbytes as bnb
     HAS_BNB = True
@@ -60,8 +60,6 @@ class ResBlock(nn.Module):
         return ACT()(x + self.conv(x))
         
     def forward(self, x):
-        if self.training:
-            return checkpoint(self._inner_forward, x, use_reentrant=False)
         return self._inner_forward(x)
 
 class SPHDataset(Dataset):
@@ -147,12 +145,12 @@ class SPHDataset(Dataset):
             if flip_h:
                 d = torch.flip(d, [-1])
                 v = torch.flip(v, [-1])
-                v[0] *= -1.0 # Negate X-velocity for horizontal flip
+                v = torch.cat([-v[0:1], v[1:2]], dim=0) # Negate X-velocity for horizontal flip out-of-place
                 m = torch.flip(m, [-1])
             if flip_v:
                 d = torch.flip(d, [-2])
                 v = torch.flip(v, [-2])
-                v[1] *= -1.0 # Negate Y-velocity for vertical flip
+                v = torch.cat([v[0:1], -v[1:2]], dim=0) # Negate Y-velocity for vertical flip out-of-place
                 m = torch.flip(m, [-2])
             
             frames_d.append(d)
@@ -182,11 +180,7 @@ class Encoder(nn.Module):
         self.fc = nn.Linear(128 * 50 * 50, latent_dim)
 
     def forward(self, x):
-        if self.training:
-            # Checkpoint the convolutional backbone to save ~400MB of activations
-            x = checkpoint(self.conv, x, use_reentrant=False)
-        else:
-            x = self.conv(x)
+        x = self.conv(x)
         return self.fc(x)
 
 class Decoder(nn.Module):
@@ -218,43 +212,28 @@ class Decoder(nn.Module):
         )
         # 200x200 Stage
         self.up_200_to_400 = nn.Sequential(
-            nn.Conv2d(64 + 32, 4, 3, padding=1),   # 1 output channel (Density) * 2^2
-            nn.PixelShuffle(2)                       # Output: 1 channel, 400x400
+            nn.Conv2d(64 + 32, 12, 3, padding=1),  # 3 output channels (Density, Vx, Vy) * 2^2
+            nn.PixelShuffle(2)                       # Output: 3 channels, 400x400
         )
-        
-        self.final_act = nn.Sigmoid()
 
     #check pointing like hell so it stops crashing mid run
     # might highkey just move to cpu training 
     def forward(self, z, prev_d, mask, coords):
         x = self.fc(z).view(-1, 128, 50, 50)
         
-        def get_context(pd, mk, cr):
-            c400 = self.context_400(torch.cat([pd, mk, cr], dim=1))
-            c200 = self.context_200(c400)
-            c100 = self.context_100(c200)
-            c50  = self.context_50(c100)
-            return c400, c200, c100, c50
-
-        if self.training:
-            ctx_400, ctx_200, ctx_100, ctx_50 = checkpoint(get_context, prev_d, mask, coords, use_reentrant=False)
-        else:
-            ctx_400, ctx_200, ctx_100, ctx_50 = get_context(prev_d, mask, coords)
+        c400 = self.context_400(torch.cat([prev_d, mask, coords], dim=1))
+        c200 = self.context_200(c400)
+        c100 = self.context_100(c200)
+        c50  = self.context_50(c100)
         
-        def stage1(feat, ctx): return self.up_50_to_100(torch.cat([feat, ctx], dim=1))
-        def stage2(feat, ctx): return self.up_100_to_200(torch.cat([feat, ctx], dim=1))
-        def stage3(feat, ctx): return self.up_200_to_400(torch.cat([feat, ctx], dim=1))
-
-        if self.training:
-            x = checkpoint(stage1, x, ctx_50, use_reentrant=False)
-            x = checkpoint(stage2, x, ctx_100, use_reentrant=False)
-            x = checkpoint(stage3, x, ctx_200, use_reentrant=False)
-        else:
-            x = stage1(x, ctx_50)
-            x = stage2(x, ctx_100)
-            x = stage3(x, ctx_200)
+        x = self.up_50_to_100(torch.cat([x, c50], dim=1))
+        x = self.up_100_to_200(torch.cat([x, c100], dim=1))
+        x = self.up_200_to_400(torch.cat([x, c200], dim=1))
         
-        return self.final_act(x)
+        d = torch.sigmoid(x[:, 0:1])
+        v = torch.tanh(x[:, 1:3]) # scaled Tanh activation for velocity
+        
+        return torch.cat([d, v], dim=1)
 
 class FullModel(nn.Module):
     def __init__(self, latent_dim=1024):
@@ -316,11 +295,7 @@ def find_max_batch_size(model, device, n_steps=1, is_bf16=False):
                     c_d = c_ds.expand(b, -1, -1, -1, -1)[:, s]
                     c_v = c_vs.expand(b, -1, -1, -1, -1)[:, s]
                     
-                    # We use checkpoint here if it's used in training
-                    if n_steps > 1:
-                        out = checkpoint(model, curr_p_d, curr_p_v, c_d, c_v, curr_mask, 0.0, use_reentrant=False)
-                    else:
-                        out = model(curr_p_d, curr_p_v, c_d, c_v, curr_mask)
+                    out = model(curr_p_d, curr_p_v, c_d, c_v, curr_mask)
                         
                     total_loss += out.sum()
                     curr_p_d = out[:, 0:1]
@@ -535,11 +510,11 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
 
     def hybrid_loss(input, target, f_weight=fluid_weight, m_weight=effective_mass_weight, grad_weight=15.0):
-        fluid_mask = (target > 0.05).float()
+        fluid_mask = (target[:, 0:1] > 0.05).float()
         background_mask = 1.0 - fluid_mask
 
-        mse_fluid = torch.sum(fluid_mask * (input - target) ** 2) / (fluid_mask.sum() + 1e-6)
-        mse_bg = torch.sum(background_mask * (input - target) ** 2) / (background_mask.sum() + 1e-6)
+        mse_fluid = torch.sum(fluid_mask * (input - target) ** 2) / (fluid_mask.sum() * input.shape[1] + 1e-6)
+        mse_bg = torch.sum(background_mask * (input - target) ** 2) / (background_mask.sum() * input.shape[1] + 1e-6)
         mse_total = (f_weight * mse_fluid) + mse_bg
 
         in_dx = input[:, :, 1:, :] - input[:, :, :-1, :]
@@ -549,14 +524,14 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         f_mask_dx = fluid_mask[:, :, 1:, :]
         f_mask_dy = fluid_mask[:, :, :, 1:]
         
-        grad_loss = (torch.sum(f_mask_dx * (in_dx - tg_dx)**2) / (f_mask_dx.sum() + 1e-6) +
-                     torch.sum(f_mask_dy * (in_dy - tg_dy)**2) / (f_mask_dy.sum() + 1e-6))
+        grad_loss = (torch.sum(f_mask_dx * (in_dx - tg_dx)**2) / (f_mask_dx.sum() * input.shape[1] + 1e-6) +
+                     torch.sum(f_mask_dy * (in_dy - tg_dy)**2) / (f_mask_dy.sum() * input.shape[1] + 1e-6))
 
         total_loss = mse_total + (grad_weight * grad_loss)
 
         if m_weight > 0:
-            mass_input = torch.mean(input, dim=(1, 2, 3))
-            mass_target = torch.mean(target, dim=(1, 2, 3))
+            mass_input = torch.mean(input[:, 0:1], dim=(1, 2, 3))
+            mass_target = torch.mean(target[:, 0:1], dim=(1, 2, 3))
             mass_loss = torch.mean((mass_input - mass_target) ** 2)
             total_loss += m_weight * mass_loss
 
@@ -589,6 +564,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
                 p_d, p_v, c_ds, c_vs, mask = p_d.to(torch.bfloat16), p_v.to(torch.bfloat16), c_ds.to(torch.bfloat16), c_vs.to(torch.bfloat16), mask.to(torch.bfloat16)
 
             with torch.amp.autocast('cuda', dtype=torch.bfloat16 if is_bf16 else torch.float16):
+                # Autoregressive Rollout Loop
                 total_sequence_loss = 0
                 noise_std = getattr(args, 'noise_std', 0.0)
                 
@@ -597,17 +573,24 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
                     curr_d_gt = c_ds[:, step]
                     curr_v_gt = c_vs[:, step]
                     
-                    # Direct execution (removed model checkpoint wrapper to allow proper graph compilation)
                     output = model(p_d, p_v, curr_d_gt, curr_v_gt, mask, noise_std=noise_std)
-                    pred_d = output 
+                        
+                    pred_d = output[:, 0:1]
+                    pred_v = output[:, 1:3]
+                    target_combined = torch.cat([curr_d_gt, curr_v_gt], dim=1)
                     
-                    step_loss = criterion(pred_d.to(torch.float32), curr_d_gt.to(torch.float32)) / (current_n_steps * accumulation_steps)
-                    total_sequence_loss += step_loss
+                    # Density + Velocity Loss (Hybrid)
+                    # Note: Divide by current_n_steps * accumulation_steps for correct averaging
+                    step_loss = criterion(output.float(), target_combined.float()) / (current_n_steps * accumulation_steps)
                     
-                    # Keep graph alive across steps
+                    total_sequence_loss = total_sequence_loss + step_loss
+                    
+                    # Update for next step in rollout (AR)
+                    # BPTT: Pass un-detached predictions
                     p_d = pred_d
+                    
                     if step + 1 < current_n_steps:
-                        p_v = c_vs[:, step] 
+                        p_v = pred_v
                 
                 loss_val = total_sequence_loss.item()
             
@@ -664,15 +647,17 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
                         curr_v_gt = c_vs[:, step]
                         
                         output = model(p_d, p_v, curr_d_gt, curr_v_gt, mask)
-                        pred_d = output
+                        pred_d = output[:, 0:1]
+                        pred_v = output[:, 1:3]
+                        target_combined = torch.cat([curr_d_gt, curr_v_gt], dim=1)
                         
-                        step_loss = criterion(pred_d.float(), curr_d_gt.float()).item()
+                        step_loss = criterion(output.float(), target_combined.float()).item()
                         total_val_loss_steps[step] += step_loss
                         batch_total_val += step_loss
-                        
-                        p_d = pred_d.detach()
+                        # Prepare for next step (AR Rollout)
+                        p_d = pred_d
                         if step + 1 < current_n_steps:
-                            p_v = c_vs[:, step].detach()
+                            p_v = pred_v
                     
                     total_val_loss += (batch_total_val / current_n_steps)
                     
