@@ -403,9 +403,8 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     # 1. Configuration & Constants
     LR = 5e-5
     LATENT_DIM_LOCAL = LATENT_DIM
-    # The dataset default skip is 10, but we can access it from dataset if needed
     
-    # 2. Setup Run Directory (unique suffix inside output_dir)
+    # 2. Setup Run Directory
     os.makedirs(output_dir, exist_ok=True)
     run_idx = 1
     while os.path.exists(os.path.join(output_dir, f"run{run_idx}")):
@@ -454,11 +453,10 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     # Initialize model
     model = FullModel(LATENT_DIM_LOCAL).to(device)
     
-    # Precision Control: BF16 saves ~2.4GB on weights/grads for this model
+    # Precision Control
     is_bf16 = args.bf16 if args and hasattr(args, 'bf16') else False
     if is_bf16 and torch.cuda.is_bf16_supported():
         model.to(torch.bfloat16)
-        # Keep normalization layers in float32 for stability and type compatibility
         for m in model.modules():
             if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d, nn.LayerNorm, nn.GroupNorm)):
                 m.float()
@@ -466,19 +464,16 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     else:
         is_bf16 = False
 
-    # 3. Load Persistent Weights (Incremental Learning)
-    # Optimized: Load to CPU first and apply after precision conversion to save VRAM
+    # Load Persistent Weights
     pretrained_path = os.path.join(output_dir, model_filename)
     if os.path.exists(pretrained_path):
         try:
             print(f"Loading existing weights from {pretrained_path} (CPU -> GPU Transfer)...")
-            # Load to CPU to avoid peak memory spike on GPU
             state_dict = torch.load(pretrained_path, map_location='cpu', weights_only=True)
-            # If the model is in BF16, we can convert the state_dict before moving to GPU
             if is_bf16:
                 state_dict = {k: v.to(torch.bfloat16) for k, v in state_dict.items()}
             model.load_state_dict(state_dict)
-            del state_dict # Force cleanup
+            del state_dict 
         except Exception as e:
             print(f"Warning: Could not load pretrained weights ({e}). Starting from scratch.")
     else:
@@ -487,7 +482,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     model_depth = model.get_depth()
     print(f"Model Depth: {model_depth} convolutional layers.")
     
-    # 4. Save Settings
+    # Save Settings
     epochs = requested_epochs if requested_epochs else 10
     with open(os.path.join(run_dir, "settings.txt"), "w") as f:
         f.write(f"Attempt: {run_idx}\n")
@@ -509,21 +504,17 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         f.write(f"Effective Mass Loss Weight: {effective_mass_weight}\n")
         f.write(f"Model Depth (Conv Layers): {model_depth}\n")
 
-    # 5. Data Pipelines
-    # Automatically handle batch size for local training
+    # Data Pipelines
     batch_size = args.batch_size if args and hasattr(args, 'batch_size') else 1
     effective_batch = args.effective_batch_size if args and hasattr(args, 'effective_batch_size') else 8
     
     if batch_size == 0:
-        # Find limit on a single GPU first, then scale
         found_limit = find_max_batch_size(model, device, current_n_steps, is_bf16)
         batch_size = found_limit * max(1, num_gpus)
         print(f"Final training batch size set to: {batch_size} ({found_limit} per GPU)")
-        # If batch size is already large enough, skip accumulation
         effective_batch = max(effective_batch, batch_size)
     
     accumulation_steps = max(1, effective_batch // batch_size)
-    
     print(f"Batch Size: {batch_size} | Effective Batch: {effective_batch} (Accumulation Steps: {accumulation_steps})")
     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True)
@@ -532,20 +523,17 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     if num_gpus > 1:
         model = nn.DataParallel(model)
         
-    # Optimizer configuration: BitsAndBytes 8-bit AdamW or Fused Adam
     if args and getattr(args, 'use_8bit_adam', False) and HAS_BNB:
         print("Using BitsAndBytes 8-bit AdamW optimizer.")
         optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=LR)
     else:
-        # Check for fused support (PyTorch 2.0+)
         import inspect
         use_fused = 'fused' in inspect.signature(optim.AdamW).parameters
         print(f"Using standard AdamW optimizer (Fused={use_fused}).")
         optimizer = optim.AdamW(model.parameters(), lr=LR, fused=use_fused)
-    # Optional: Use Adam with lower precision or specific flags if still OOM
-    # optimizer = optim.Adam(model.parameters(), lr=LR, eps=1e-4) 
     
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
+
     def hybrid_loss(input, target, f_weight=fluid_weight, m_weight=effective_mass_weight, grad_weight=15.0):
         fluid_mask = (target > 0.05).float()
         background_mask = 1.0 - fluid_mask
@@ -566,9 +554,6 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
 
         total_loss = mse_total + (grad_weight * grad_loss)
 
-        # I dont think this is right ngl
-        # esp cause of how rasterisation works, this can be a bit sketch
-
         if m_weight > 0:
             mass_input = torch.mean(input, dim=(1, 2, 3))
             mass_target = torch.mean(target, dim=(1, 2, 3))
@@ -579,7 +564,6 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
 
     criterion = hybrid_loss
     
-    # BF16 doesn't need scaling
     if is_bf16 and torch.cuda.is_bf16_supported():
         scaler = None
     else:
@@ -592,7 +576,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
 
     epochs = requested_epochs if requested_epochs else 50
     for epoch in range(epochs):
-        # --- TRAINING LOOP ---
+        # --- TRAINING LOOP (UPDATED FOR FULL BPTT) ---
         model.train()
         total_train_loss = 0
         total_train_var = 0
@@ -605,44 +589,33 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
                 p_d, p_v, c_ds, c_vs, mask = p_d.to(torch.bfloat16), p_v.to(torch.bfloat16), c_ds.to(torch.bfloat16), c_vs.to(torch.bfloat16), mask.to(torch.bfloat16)
 
             with torch.amp.autocast('cuda', dtype=torch.bfloat16 if is_bf16 else torch.float16):
-                # Autoregressive Rollout Loop
-                total_step_loss = 0
+                total_sequence_loss = 0
                 noise_std = getattr(args, 'noise_std', 0.0)
                 
+                # Rollout sequence without detaching intermediate steps
                 for step in range(current_n_steps):
                     curr_d_gt = c_ds[:, step]
                     curr_v_gt = c_vs[:, step]
                     
-                    # Use gradient checkpointing for the model call during AR rollout to save VRAM
-                    if current_n_steps > 1:
-                        output = checkpoint(model, p_d, p_v, curr_d_gt, curr_v_gt, mask, noise_std, use_reentrant=False)
-                    else:
-                        output = model(p_d, p_v, curr_d_gt, curr_v_gt, mask, noise_std=noise_std)
-                        
-                    pred_d = output # Now 1 channel (Density)
+                    # Direct execution (removed model checkpoint wrapper to allow proper graph compilation)
+                    output = model(p_d, p_v, curr_d_gt, curr_v_gt, mask, noise_std=noise_std)
+                    pred_d = output 
                     
-                    # Density Loss (Hybrid)
-                    # Note: Divide by current_n_steps * accumulation_steps for correct averaging
                     step_loss = criterion(pred_d.to(torch.float32), curr_d_gt.to(torch.float32)) / (current_n_steps * accumulation_steps)
+                    total_sequence_loss += step_loss
                     
-                    # TBPTT: Backward per step to keep graph shallow and VRAM constant
-                    if scaler:
-                        scaler.scale(step_loss).backward()
-                    else:
-                        step_loss.backward()
-                        
-                    total_step_loss += step_loss.item()
-                    
-                    # Update for next step in rollout (AR)
-                    # DETACH is the key here: it prevents the graph from growing linearly with N
-                    p_d = pred_d.detach()
-                    
-                    # Since we don't predict velocity, we use the next step's GT velocity as input 
+                    # Keep graph alive across steps
+                    p_d = pred_d
                     if step + 1 < current_n_steps:
-                        p_v = c_vs[:, step].detach() 
+                        p_v = c_vs[:, step] 
                 
-                loss_val = total_step_loss # For logging usage below
-                loss = None # Placeholder to avoid accidental reuse
+                loss_val = total_sequence_loss.item()
+            
+            # Backpropagate sequence dependencies globally
+            if scaler:
+                scaler.scale(total_sequence_loss).backward()
+            else:
+                total_sequence_loss.backward()
             
             if (i + 1) % accumulation_steps == 0:
                 if scaler:
@@ -655,12 +628,10 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
             total_train_loss += (loss_val * accumulation_steps * current_n_steps)
             total_train_var += torch.var(pred_d).item()
             
-            # Periodically Clear Fragments
             if (i + 1) % 50 == 0:
                 torch.cuda.empty_cache()
                 gc.collect()
         
-        # Handle leftover gradients if dataset size not divisible
         if (len(train_loader) % accumulation_steps) != 0:
             if scaler:
                 scaler.step(optimizer)
@@ -681,16 +652,13 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         with torch.no_grad():
             for p_d, p_v, c_ds, c_vs, mask in val_loader:
                 p_d, p_v, c_ds, c_vs, mask = p_d.to(device), p_v.to(device), c_ds.to(device), c_vs.to(device), mask.to(device)
-                
                 if is_bf16:
                    p_d, p_v, c_ds, c_vs, mask = p_d.to(torch.bfloat16), p_v.to(torch.bfloat16), c_ds.to(torch.bfloat16), c_vs.to(torch.bfloat16), mask.to(torch.bfloat16)
                 
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16 if is_bf16 else torch.float16):
-                    # Initial state for Ident baseline (Step 0)
                     p_d_init = p_d.clone()
-                    
-                    # Full Rollout Validation
                     batch_total_val = 0
+                    
                     for step in range(current_n_steps):
                         curr_d_gt = c_ds[:, step]
                         curr_v_gt = c_vs[:, step]
@@ -702,14 +670,12 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
                         total_val_loss_steps[step] += step_loss
                         batch_total_val += step_loss
                         
-                        # Prepare for next step (AR Rollout)
                         p_d = pred_d.detach()
                         if step + 1 < current_n_steps:
                             p_v = c_vs[:, step].detach()
                     
                     total_val_loss += (batch_total_val / current_n_steps)
                     
-                    # Baselines calculated on the first step for reference
                     curr_d_gt_0 = c_ds[:, 0]
                     total_val_zero += criterion(torch.zeros_like(curr_d_gt_0).float(), curr_d_gt_0.float()).item()
                     total_val_ident += criterion(p_d_init.float(), curr_d_gt_0.float()).item()
@@ -718,7 +684,6 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
                 
                 torch.cuda.empty_cache()
 
-        # Reports normalized MSE
         avg_train_loss = total_train_loss / len(train_loader)
         avg_val_loss = total_val_loss / len(val_loader)
         avg_val_zero = total_val_zero / len(val_loader)
@@ -727,27 +692,29 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         avg_val_var = total_val_var / len(val_loader)
         avg_val_gt_var = total_val_gt_var / len(val_loader)
         
-        # Calculate per-step averages
         avg_val_steps = [s / len(val_loader) for s in total_val_loss_steps]
         step_error_str = ", ".join([f"S{i+1}: {err:.4f}" for i, err in enumerate(avg_val_steps)])
         
-        # Step the scheduler
+        print("-" * 90)
+        print(f"Epoch {epoch+1:02d}/{epochs:02d}")
+        print(f"  > LOSSES:   Train: {avg_train_loss:.4f}  |  Val Rollout: {avg_val_loss:.4f}")
+        print(f"  > STEPS:    {step_error_str}")
+        print(f"  > BASELINES: Zero-Field Baseline: {avg_val_zero:.4f}  |  Identity (Static) Baseline: {avg_val_ident:.4f}")
+        print(f"  > VARIANCE: Target GT Var: {avg_val_gt_var:.5f}  |  Model Output Var: {avg_val_var:.5f}  (Train Var: {avg_train_var:.5f})")
+        print("-" * 90)
+
         scheduler.step(avg_val_loss)
         
-        print(f"Epoch {epoch+1}/{epochs}")
-        print(f"    Train Loss: {avg_train_loss:.8f} | Val Loss: {avg_val_loss:.8f}")
-        print(f"    Val Step Errors: [{step_error_str}]")
-        print(f"    Val Baselines: [Zero: {avg_val_zero:.8f}, Ident: {avg_val_ident:.8f}]")
-        print(f"    Variance: [Train: {avg_train_var:.8f}, Val: {avg_val_var:.8f}, Val_GT: {avg_val_gt_var:.8f}]")
-        print(f"    Val Max: [Pred: {pred_d.max().item():.4f}, GT: {curr_d_gt.max().item():.4f}]")
-        
-        # Log to CSV
         with open(log_file, "a") as f:
-            f.write(f"{epoch+1},{avg_train_loss:.8f},{avg_val_loss:.8f},{avg_val_zero:.8f},{avg_val_ident:.8f},{avg_train_var:.8f},{avg_val_var:.8f}\n")
+            f.write(f"{epoch+1},{avg_train_loss:.6f},{avg_val_loss:.6f},{avg_val_zero:.6f},{avg_val_ident:.6f},{avg_train_var:.6f},{avg_val_var:.6f}\n")
             
-        torch.save(model.state_dict(), os.path.join(run_dir, "best_model.pth"))
-        # Also keep a copy in output_dir (run-collection root) for current state
-        torch.save(model.state_dict(), os.path.join(output_dir, model_filename))
+        # Keep tracking best checkpoints incrementally
+        if num_gpus > 1:
+            torch.save(model.module.state_dict(), os.path.join(output_dir, model_filename))
+        else:
+            torch.save(model.state_dict(), os.path.join(output_dir, model_filename))
+            
+    print("Training Cycle Finished.")
 
 if __name__ == "__main__":
     import argparse

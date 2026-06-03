@@ -9,19 +9,19 @@ import argparse
 
 # --- Configuration & Defaults ---
 DEFAULT_ITERATIONS = 30
-DEFAULT_RUNS_PER_ITERATION = 15
+DEFAULT_RUNS_PER_ITERATION = 40
 DEFAULT_MAX_PARALLEL = 3
 DEFAULT_MAX_SESSIONS = 20
 DEFAULT_FRAMES_PER_RUN = 750
-DEFAULT_MASS_LOSS_START_CYCLE = 2
+DEFAULT_MASS_LOSS_START_CYCLE = 3
 DEFAULT_MASS_LOSS_WEIGHT = 2.5
-DEFAULT_FLUID_LOSS_WEIGHT = 35.0
+DEFAULT_FLUID_LOSS_WEIGHT = 25.0
 DEFAULT_NOISE_STD = 0.01
 DEFAULT_AR_STEPS = 5
-DEFAULT_AR_START_CYCLE = 2
+DEFAULT_AR_START_CYCLE = 4
 DEFAULT_AR_INCREMENT_INTERVAL = 3
 DEFAULT_SKIP_INITIAL = 5
-DEFAULT_USE_8BIT_ADAM = True
+DEFAULT_USE_8BIT_ADAM = False 
 
 def run_simulations(iteration, run_name, runs_per_iteration, max_parallel, frames_per_run, data_dir, log_dir):
     """Launches simulations in parallel with a throttling limit."""
@@ -174,8 +174,7 @@ def main():
             "--ar_start_cycle", str(args.ar_start_cycle),
             "--ar_increment_interval", str(args.ar_increment_interval),
             "--noise_std", str(args.noise_std),
-            "--skip_initial", str(args.skip_initial),
-            "--bf16"
+            "--skip_initial", str(args.skip_initial)
         ]
         
         if args.use_8bit_adam:

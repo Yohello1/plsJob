@@ -12,23 +12,24 @@ SRCS = $(wildcard $(SRC_DIR)/*.cpp)
 # 3. Map src/*.cpp to obj/*.o
 OBJS = $(SRCS:$(SRC_DIR)/%.cpp=$(OBJ_DIR)/%.o)
 
-# 4. Flags
-# -I$(INC_DIR) tells the compiler to look in the include folder for .hpp files
-CFLAGS = -std=c++20 -O3 -g -ffast-math -lsycl -march=native  -ffast-math -funroll-loops  -flto -fopenmp -Wall -I$(INC_DIR)
-
-# more optimsisation stuff for cpu only
-#-ftree-vectorize -fvect-cost-model=unlimited -fopt-info-vec-optimized
-
-# SDL Check
+# 4. SDL Check
 HAS_SDL := $(shell pkg-config --exists sdl2 SDL2_image && echo yes || echo no)
 
+# 5. Base Flags (Common to both Compilation and Linking)
+# -flto and -fuse-ld=lld MUST be visible to both steps!
+COMMON_FLAGS = -std=c++20 -O3 -g -ffast-math -funroll-loops -flto -fuse-ld=lld -fopenmp -march=native
 
-SDL_CFLAGS = $(shell pkg-config --cflags sdl2 SDL2_image) -DUSE_SDL
-SDL_LDFLAGS = $(shell pkg-config --libs sdl2 SDL2_image)
+# Compiler-only flags
+CFLAGS = $(COMMON_FLAGS) -Wall -I$(INC_DIR)
 
+# Linker-only flags
+LDFLAGS = $(COMMON_FLAGS) -lpthread -Wl,-rpath,/u2/s23adhik/llvm-custom/lib/x86_64-unknown-linux-gnu
 
-CFLAGS += $(SDL_CFLAGS)
-LDFLAGS = $(SDL_LDFLAGS) -g -lpthread -fopenmp -flto
+# 6. Conditionally Add SDL2 if found
+ifeq ($(HAS_SDL),yes)
+    CFLAGS += $(shell pkg-config --cflags sdl2 SDL2_image) -DUSE_SDL
+    LDFLAGS += $(shell pkg-config --libs sdl2 SDL2_image)
+endif
 
 # Default Target
 all: $(OBJ_DIR) $(OBJ_NAME)
@@ -37,7 +38,7 @@ all: $(OBJ_DIR) $(OBJ_NAME)
 $(OBJ_DIR):
 	mkdir -p $(OBJ_DIR)
 
-# Final Linker Step + Auto-Launch
+# Final Linker Step
 $(OBJ_NAME) : $(OBJS)
 	$(CC) $(OBJS) $(LDFLAGS) -o $(OBJ_NAME)
 	@echo "----------------------------"
