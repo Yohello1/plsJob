@@ -504,15 +504,21 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     print(f"Using standard AdamW optimizer (Fused={use_fused}).")
     optimizer = optim.AdamW(model.parameters(), lr=LR, fused=use_fused)
 
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=2, factor=0.5)
 
-    def hybrid_loss(input, target, f_weight=fluid_weight, m_weight=effective_mass_weight, grad_weight=15.0):
+    def hybrid_loss(input, target, f_weight=fluid_weight, m_weight=effective_mass_weight, grad_weight=15.0, mean_weight=25.0):
         fluid_mask = (target[:, 0:1] > 0.05).float()
         background_mask = 1.0 - fluid_mask
 
         mse_fluid = torch.sum(fluid_mask * (input - target) ** 2) / (fluid_mask.sum() * input.shape[1] + 1e-6)
         mse_bg = torch.sum(background_mask * (input - target) ** 2) / (background_mask.sum() * input.shape[1] + 1e-6)
         mse_total = (f_weight * mse_fluid) + mse_bg
+
+        # Penalise zero-collapse: force fluid-region mean to match target mean
+        pred_fluid_mean = torch.sum(fluid_mask * input[:, 0:1]) / (fluid_mask.sum() + 1e-6)
+        gt_fluid_mean   = torch.sum(fluid_mask * target[:, 0:1]) / (fluid_mask.sum() + 1e-6)
+        mean_match_loss = (pred_fluid_mean - gt_fluid_mean) ** 2
+        mse_total = mse_total + mean_weight * mean_match_loss
 
         in_dx = input[:, :, 1:, :] - input[:, :, :-1, :]
         in_dy = input[:, :, :, 1:] - input[:, :, :, :-1]
