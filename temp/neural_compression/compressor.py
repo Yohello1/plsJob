@@ -544,6 +544,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         f.write("epoch,train_loss,val_loss,val_zero,val_ident,train_var,val_var,grad_norm\n")
 
     epochs = requested_epochs if requested_epochs else 50
+    best_val_loss = float('inf')
     for epoch in range(epochs):
         # --- TRAINING LOOP (UPDATED FOR FULL BPTT) ---
         model.train()
@@ -599,7 +600,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
             if (i + 1) % accumulation_steps == 0:
                 if scaler:
                     scaler.unscale_(optimizer)
-                grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=float('inf'))
+                grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 total_grad_norm += grad_norm.item()
                 grad_norm_steps += 1
                 if scaler:
@@ -619,7 +620,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         if (len(train_loader) % accumulation_steps) != 0:
             if scaler:
                 scaler.unscale_(optimizer)
-            grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=float('inf'))
+            grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             total_grad_norm += grad_norm.item()
             grad_norm_steps += 1
             if scaler:
@@ -646,6 +647,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
                 
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16 if is_bf16 else torch.float16):
                     p_d_init = p_d.clone()
+                    p_v_init = p_v.clone()
                     batch_total_val = 0
                     
                     for step in range(current_n_steps):
@@ -667,11 +669,14 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
                     
                     total_val_loss += (batch_total_val / current_n_steps)
                     
-                    curr_d_gt_0 = c_ds[:, 0]
-                    total_val_zero += criterion(torch.zeros_like(curr_d_gt_0).float(), curr_d_gt_0.float()).item()
-                    total_val_ident += criterion(p_d_init.float(), curr_d_gt_0.float()).item()
+                    # Baselines use full 3-channel target (density + velocity) to match model loss
+                    target_combined_0 = torch.cat([c_ds[:, 0], c_vs[:, 0]], dim=1)
+                    zero_pred = torch.zeros_like(target_combined_0)
+                    ident_pred = torch.cat([p_d_init, p_v_init], dim=1)
+                    total_val_zero += criterion(zero_pred.float(), target_combined_0.float()).item()
+                    total_val_ident += criterion(ident_pred.float(), target_combined_0.float()).item()
                     total_val_var += torch.var(pred_d.float()).item()
-                    total_val_gt_var += torch.var(curr_d_gt_0.float()).item()
+                    total_val_gt_var += torch.var(c_ds[:, 0].float()).item()
                 
                 torch.cuda.empty_cache()
 
@@ -701,11 +706,13 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         with open(log_file, "a") as f:
             f.write(f"{epoch+1},{avg_train_loss:.6f},{avg_val_loss:.6f},{avg_val_zero:.6f},{avg_val_ident:.6f},{avg_train_var:.6f},{avg_val_var:.6f},{avg_grad_norm:.6f}\n")
             
-        # Keep tracking best checkpoints incrementally
-        if num_gpus > 1:
-            torch.save(model.module.state_dict(), os.path.join(output_dir, model_filename))
-        else:
-            torch.save(model.state_dict(), os.path.join(output_dir, model_filename))
+        # Only save best checkpoint
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            if num_gpus > 1:
+                torch.save(model.module.state_dict(), os.path.join(output_dir, model_filename))
+            else:
+                torch.save(model.state_dict(), os.path.join(output_dir, model_filename))
             
     print("Training Cycle Finished.")
 
