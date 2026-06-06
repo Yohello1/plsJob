@@ -2,12 +2,14 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.checkpoint import checkpoint
 import numpy as np
 import os
 import glob
 import sys
 import random
 import gc
+import inspect
 
 try:
     import bitsandbytes as bnb
@@ -21,7 +23,7 @@ BUFFER_WIDTH = 400
 BUFFER_HEIGHT = 400
 
 # Normalization factors (default)
-DENSITY_NORM = 1.0 / 0.02 
+DENSITY_NORM = 1.0 / 0.020 
 VELOCITY_NORM = 1.0 / 7.5 
 LATENT_DIM = 1024
 # Activation Configuration\
@@ -180,7 +182,7 @@ class Encoder(nn.Module):
         self.fc = nn.Linear(128 * 50 * 50, latent_dim)
 
     def forward(self, x):
-        x = self.conv(x)
+        x = checkpoint(self.conv, x, use_reentrant=False)
         return self.fc(x)
 
 class Decoder(nn.Module):
@@ -221,14 +223,14 @@ class Decoder(nn.Module):
     def forward(self, z, prev_d, mask, coords):
         x = self.fc(z).view(-1, 128, 50, 50)
         
-        c400 = self.context_400(torch.cat([prev_d, mask, coords], dim=1))
-        c200 = self.context_200(c400)
-        c100 = self.context_100(c200)
-        c50  = self.context_50(c100)
+        c400 = checkpoint(self.context_400, torch.cat([prev_d, mask, coords], dim=1), use_reentrant=False)
+        c200 = checkpoint(self.context_200, c400, use_reentrant=False)
+        c100 = checkpoint(self.context_100, c200, use_reentrant=False)
+        c50  = checkpoint(self.context_50,  c100, use_reentrant=False)
         
-        x = self.up_50_to_100(torch.cat([x, c50], dim=1))
-        x = self.up_100_to_200(torch.cat([x, c100], dim=1))
-        x = self.up_200_to_400(torch.cat([x, c200], dim=1))
+        x = checkpoint(self.up_50_to_100,  torch.cat([x, c50],   dim=1), use_reentrant=False)
+        x = checkpoint(self.up_100_to_200, torch.cat([x, c100],  dim=1), use_reentrant=False)
+        x = checkpoint(self.up_200_to_400, torch.cat([x, c200],  dim=1), use_reentrant=False)
         
         d = torch.sigmoid(x[:, 0:1])
         v = torch.tanh(x[:, 1:3]) # scaled Tanh activation for velocity
@@ -497,16 +499,11 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     
     if num_gpus > 1:
         model = nn.DataParallel(model)
-        
-    if args and getattr(args, 'use_8bit_adam', False) and HAS_BNB:
-        print("Using BitsAndBytes 8-bit AdamW optimizer.")
-        optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=LR)
-    else:
-        import inspect
-        use_fused = 'fused' in inspect.signature(optim.AdamW).parameters
-        print(f"Using standard AdamW optimizer (Fused={use_fused}).")
-        optimizer = optim.AdamW(model.parameters(), lr=LR, fused=use_fused)
-    
+
+    use_fused = 'fused' in inspect.signature(optim.AdamW).parameters
+    print(f"Using standard AdamW optimizer (Fused={use_fused}).")
+    optimizer = optim.AdamW(model.parameters(), lr=LR, fused=use_fused)
+
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
 
     def hybrid_loss(input, target, f_weight=fluid_weight, m_weight=effective_mass_weight, grad_weight=15.0):
@@ -539,15 +536,12 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
 
     criterion = hybrid_loss
     
-    if is_bf16 and torch.cuda.is_bf16_supported():
-        scaler = None
-    else:
-        scaler = torch.amp.GradScaler('cuda')
+    scaler = torch.amp.GradScaler('cuda')
 
     # Prepare loss logging
     log_file = os.path.join(run_dir, "losses.csv")
     with open(log_file, "w") as f:
-        f.write("epoch,train_loss,val_loss,val_zero,val_ident,train_var,val_var\n")
+        f.write("epoch,train_loss,val_loss,val_zero,val_ident,train_var,val_var,grad_norm\n")
 
     epochs = requested_epochs if requested_epochs else 50
     for epoch in range(epochs):
@@ -555,6 +549,8 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         model.train()
         total_train_loss = 0
         total_train_var = 0
+        total_grad_norm = 0
+        grad_norm_steps = 0
         optimizer.zero_grad(set_to_none=True)
         
         for i, (p_d, p_v, c_ds, c_vs, mask) in enumerate(train_loader):
@@ -602,6 +598,11 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
             
             if (i + 1) % accumulation_steps == 0:
                 if scaler:
+                    scaler.unscale_(optimizer)
+                grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=float('inf'))
+                total_grad_norm += grad_norm.item()
+                grad_norm_steps += 1
+                if scaler:
                     scaler.step(optimizer)
                     scaler.update()
                 else:
@@ -616,6 +617,11 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
                 gc.collect()
         
         if (len(train_loader) % accumulation_steps) != 0:
+            if scaler:
+                scaler.unscale_(optimizer)
+            grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=float('inf'))
+            total_grad_norm += grad_norm.item()
+            grad_norm_steps += 1
             if scaler:
                 scaler.step(optimizer)
                 scaler.update()
@@ -676,6 +682,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         avg_train_var = total_train_var / len(train_loader)
         avg_val_var = total_val_var / len(val_loader)
         avg_val_gt_var = total_val_gt_var / len(val_loader)
+        avg_grad_norm = total_grad_norm / max(1, grad_norm_steps)
         
         avg_val_steps = [s / len(val_loader) for s in total_val_loss_steps]
         step_error_str = ", ".join([f"S{i+1}: {err:.4f}" for i, err in enumerate(avg_val_steps)])
@@ -686,12 +693,13 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         print(f"  > STEPS:    {step_error_str}")
         print(f"  > BASELINES: Zero-Field Baseline: {avg_val_zero:.4f}  |  Identity (Static) Baseline: {avg_val_ident:.4f}")
         print(f"  > VARIANCE: Target GT Var: {avg_val_gt_var:.5f}  |  Model Output Var: {avg_val_var:.5f}  (Train Var: {avg_train_var:.5f})")
+        print(f"  > GRAD NORM: {avg_grad_norm:.4f}")
         print("-" * 90)
 
         scheduler.step(avg_val_loss)
         
         with open(log_file, "a") as f:
-            f.write(f"{epoch+1},{avg_train_loss:.6f},{avg_val_loss:.6f},{avg_val_zero:.6f},{avg_val_ident:.6f},{avg_train_var:.6f},{avg_val_var:.6f}\n")
+            f.write(f"{epoch+1},{avg_train_loss:.6f},{avg_val_loss:.6f},{avg_val_zero:.6f},{avg_val_ident:.6f},{avg_train_var:.6f},{avg_val_var:.6f},{avg_grad_norm:.6f}\n")
             
         # Keep tracking best checkpoints incrementally
         if num_gpus > 1:
