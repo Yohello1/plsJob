@@ -52,13 +52,14 @@ def visualize_reconstruction(model_path, data_dir, output_png="reconstruction.pn
         # Add batch dimension
         p_d_in = p_d.unsqueeze(0).to(device)
         p_v_in = p_v.unsqueeze(0).to(device)
-        c_d_in = c_d.unsqueeze(0).to(device)
-        c_v_in = c_v.unsqueeze(0).to(device)
+        # c_d/c_v have shape [n_steps, C, H, W] — take step 0
+        c_d_in = (c_d[0] if c_d.dim() == 4 else c_d).unsqueeze(0).to(device)
+        c_v_in = (c_v[0] if c_v.dim() == 4 else c_v).unsqueeze(0).to(device)
         mask_in = mask.unsqueeze(0).to(device)
         
         pred_d = model(p_d_in, p_v_in, c_d_in, c_v_in, mask_in)
         pred_d = pred_d.squeeze().cpu().numpy()
-        gt_d = c_d.squeeze().numpy()
+        gt_d = (c_d[0] if c_d.dim() == 4 else c_d).squeeze().numpy()
         prev_d = p_d.squeeze().numpy()
 
     # 5. Plotting
