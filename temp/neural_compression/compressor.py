@@ -65,13 +65,14 @@ class ResBlock(nn.Module):
         return self._inner_forward(x)
 
 class SPHDataset(Dataset):
-    def __init__(self, data_dirs, skip=10, n_steps=1, skip_initial=1):
+    def __init__(self, data_dirs, skip=10, n_steps=1, skip_initial=1, augment=True):
         if isinstance(data_dirs, str):
             data_dirs = [data_dirs]
         self.data_dirs = data_dirs
         self.samples = []
         self.skip = skip
         self.n_steps = n_steps
+        self.augment = augment
         
         self.frame_size = 4 * BUFFER_WIDTH * BUFFER_HEIGHT * 4 # 4 fields * N * 4 bytes
         self.field_size = BUFFER_WIDTH * BUFFER_HEIGHT * 4
@@ -132,8 +133,8 @@ class SPHDataset(Dataset):
         frames_v = []
         
         # Random Physical Symmetry Flips (Data Augmentation)
-        flip_h = random.random() > 0.5
-        flip_v = random.random() > 0.5
+        flip_h = self.augment and random.random() > 0.5
+        flip_v = self.augment and random.random() > 0.5
         
         for step in range(self.n_steps + 1):
             f_idx = start_idx + step * self.skip
@@ -371,8 +372,11 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Detected {num_gpus} GPU(s). Using device: {device}")
 
-    # Use specified data_dir
-    session_dirs = [os.path.join(data_dir, d) for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d)) and d != "frames"] if os.path.exists(data_dir) else []
+    # Use specified data_dir (or explicit session list if provided)
+    if args and getattr(args, 'session_dirs', None):
+        session_dirs = [d for d in args.session_dirs.split(',') if os.path.isdir(d)]
+    else:
+        session_dirs = [os.path.join(data_dir, d) for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d)) and d != "frames"] if os.path.exists(data_dir) else []
     if not session_dirs:
         print(f"No simulation data found in {data_dir}.")
         return
@@ -391,7 +395,8 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     print(f"Starting {run_dir}...")
 
     # 3. Split Dataset (90% Train, 10% Val)
-    random.seed(42)
+    # No fixed seed: each training run gets a different split so all runs
+    # eventually appear in training across multiple calls.
     random.shuffle(session_dirs)
     split_idx = max(1, int(len(session_dirs) * 0.9))
     if split_idx >= len(session_dirs) and len(session_dirs) > 1:
@@ -419,8 +424,8 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     velocity_norm = 1.0 / max_v
     print(f"Normalization: Density Scale={density_norm:.6f}, Velocity Scale={velocity_norm:.6f}")
 
-    train_dataset = SPHDataset(train_dirs, skip=args.skip_frames if args else 10, n_steps=current_n_steps, skip_initial=args.skip_initial if args else 1)
-    val_dataset = SPHDataset(val_dirs, skip=args.skip_frames if args else 10, n_steps=current_n_steps)
+    train_dataset = SPHDataset(train_dirs, skip=args.skip_frames if args else 10, n_steps=current_n_steps, skip_initial=args.skip_initial if args else 1, augment=True)
+    val_dataset = SPHDataset(val_dirs, skip=args.skip_frames if args else 10, n_steps=current_n_steps, augment=False)
     
     train_dataset.set_norms(density_norm, velocity_norm)
     val_dataset.set_norms(density_norm, velocity_norm)
@@ -514,6 +519,11 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         mse_bg = torch.sum(background_mask * (input - target) ** 2) / (background_mask.sum() * input.shape[1] + 1e-6)
         mse_total = (f_weight * mse_fluid) + mse_bg
 
+        # False-negative penalty: fluid in GT but not in prediction — asymmetric, 5x harder
+        fn_mask = fluid_mask * (input[:, 0:1] < 0.05).float()
+        fn_loss = torch.sum(fn_mask * (target[:, 0:1] - input[:, 0:1]) ** 2) / (fn_mask.sum() + 1e-6)
+        mse_total = mse_total + f_weight * 5.0 * fn_loss
+
         # Penalise zero-collapse: force fluid-region mean to match target mean
         pred_fluid_mean = torch.sum(fluid_mask * input[:, 0:1]) / (fluid_mask.sum() + 1e-6)
         gt_fluid_mean   = torch.sum(fluid_mask * target[:, 0:1]) / (fluid_mask.sum() + 1e-6)
@@ -551,6 +561,8 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
 
     epochs = requested_epochs if requested_epochs else 50
     best_val_loss = float('inf')
+    early_stop_patience = 3
+    epochs_no_improve = 0
     for epoch in range(epochs):
         # --- TRAINING LOOP (UPDATED FOR FULL BPTT) ---
         model.train()
@@ -715,10 +727,16 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         # Only save best checkpoint
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
+            epochs_no_improve = 0
             if num_gpus > 1:
                 torch.save(model.module.state_dict(), os.path.join(output_dir, model_filename))
             else:
                 torch.save(model.state_dict(), os.path.join(output_dir, model_filename))
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= early_stop_patience:
+                print(f"Early stopping: val loss hasn't improved for {early_stop_patience} epochs.")
+                break
             
     print("Training Cycle Finished.")
 
@@ -728,6 +746,7 @@ if __name__ == "__main__":
     parser.add_argument("--cycle", type=int, default=1, help="Current active learning cycle index")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--data_dir", type=str, default="data")
+    parser.add_argument("--session_dirs", type=str, default=None, help="Comma-separated explicit list of session dirs (overrides --data_dir discovery)")
     parser.add_argument("--output_dir", type=str, default="attempts")
     parser.add_argument("--model_name", type=str, default="best_model.pth")
     parser.add_argument("--fluid_weight", type=float, default=25.0)

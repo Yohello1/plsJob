@@ -60,7 +60,7 @@ def visualize_reconstruction(model_path, data_dir, output_png="reconstruction.pn
         mask_in = mask.unsqueeze(0).to(device)
         
         pred_d = model(p_d_in, p_v_in, c_d_in, c_v_in, mask_in)
-        pred_d = pred_d.squeeze().cpu().numpy()
+        pred_d = pred_d[0, 0].cpu().numpy()  # channel 0 = density
         gt_d = (c_d[0] if c_d.dim() == 4 else c_d).squeeze().numpy()
         prev_d = p_d.squeeze().numpy()
 
