@@ -109,7 +109,7 @@ int main(int argc, char** argv) {
     std::string base = (data_root && strlen(data_root) > 0) ? std::string(data_root) : "data";
     std::filesystem::create_directories(base + "/frames");
     
-    JD::logging::init();
+    // JD::logging::init();
 
     
     // Robust seeding
@@ -219,7 +219,7 @@ int main(int argc, char** argv) {
         frame_num++;
 
         // Log the frame data to sim_data.bin
-        JD::logging::log(frame_num,
+        /* JD::logging::log(frame_num,
                          JD::graphics::offsets,
                          JD::graphics::cells_ctr,
                          JD::graphics::particles_loc,
@@ -228,7 +228,7 @@ int main(int argc, char** argv) {
                          JD::floaters::floatersA,
                          PARTICLE_SIZE,
                          JD::sycl::compute_queue);
-
+*/
         if (max_frames > 0 && frame_num >= max_frames) {
             quit = true;
         }
@@ -254,6 +254,6 @@ int main(int argc, char** argv) {
     }
 #endif
 
-     JD::logging::finish();
+     // JD::logging::finish();
      return 0;
 }

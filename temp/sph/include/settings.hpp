@@ -57,7 +57,7 @@ inline const float PARTICLE_VISCOSITY_K_COEFF = 25.0f/std::numbers::pi_v<float> 
 inline const float PARTICLE_SPIKY_K = -45.0f / (std::numbers::pi_v<float> * std::pow(PARTICLE_SIZE, 6)); 
 
 inline constexpr size_t DESIRED_FLOATERS = 50000;
-inline constexpr size_t GHOST_FLOATERS = 200000;  // should be a function/equation but I cannot rn make it up - siracha at 3:45am
+inline constexpr size_t GHOST_FLOATERS = 20000;  // should be a function/equation but I cannot rn make it up - siracha at 3:45am
 inline constexpr size_t FLOATER_AMT = DESIRED_FLOATERS + GHOST_FLOATERS;  
 inline constexpr int FLOATER_SPEED = 3;
 
