@@ -1,6 +1,6 @@
 import sys
 
-from pls_compression.orchestration import main as _main
+from pls_compression.pipeline import main as _main
 
 
 def main(argv=None):

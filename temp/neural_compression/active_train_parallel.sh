@@ -138,15 +138,19 @@ done
 # computed from that and not from WIDTH/HEIGHT, which describe the model and
 # must match the generated data. One 400x400 float32 frame is ~2.4 MiB and
 # spawn_random.sh on its own defaults to 10000 frames (~24 GiB) per session.
+# Create the run directories up front. DATA_DIR is frequently a fresh
+# per-run path (data/run_<timestamp>) supplied by the caller, and a wrapper may
+# inspect or prune it before Python starts; without this, a glob like
+# "$DATA_DIR"/*/ matches nothing and cleanup reports an empty or missing
+# directory instead of pruning the sessions that were just generated.
+mkdir -p -- "$DATA_DIR" "$OUTPUT_DIR"
+
 frame_bytes=$((4 * SIM_WIDTH * SIM_HEIGHT * 4))
 session_bytes=$((FRAMES_PER_RUN * frame_bytes))
 total_bytes=$((RUNS_PER_CYCLE * CYCLES * session_bytes))
-# Walk up to the nearest existing ancestor, because the data directory usually
-# does not exist yet and df on it would fail and silently skip the check.
+# DATA_DIR now exists, so df measures the filesystem the sessions will land on
+# rather than the nearest existing ancestor, which can be a different mount.
 probe=$DATA_DIR
-while [ ! -d "$probe" ] && [ "$probe" != "/" ]; do
-    probe=$(dirname -- "$probe")
-done
 avail_bytes=$(df -Pk "$probe" 2>/dev/null | awk 'NR==2 {print $4 * 1024}')
 
 if [ "$PHASE" != train ] && { [ "$WIDTH" -ne "$SIM_WIDTH" ] || [ "$HEIGHT" -ne "$SIM_HEIGHT" ]; }; then
