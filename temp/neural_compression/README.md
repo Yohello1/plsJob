@@ -11,6 +11,7 @@ This package trains and evaluates neural compression models for sessions produce
 - `pls_compression.metrics` reports MSE, MAE, and structural similarity alongside the zero and identity baselines, so every number is reported next to the two trivial predictors. It adds a fluid-masked SSIM, which separates a total fluid dropout far more sharply than the unmasked mean.
 - `pls_compression.evaluation` is the shared rollout and sanity-check implementation used by `check_model.py` and the tools. It performs a two-step rollout by default, uses saved normalization, and never writes to a memory map.
 - `pls_compression.orchestration` is the single active-learning implementation. The shell entry points are thin wrappers around it.
+- `pls_compression.pipeline` is the two-phase command-line entry point: it reads the phase and the environment defaults, applies the data budget guard, and forwards everything else to `orchestration` for validation.
 
 ## Data contract
 
@@ -225,32 +226,48 @@ The first write always happens, so a run that improves only marginally, or never
 
 Both settings are worth raising for long runs, and neither changes what is trained.
 
-### The pipeline script
+### The pipeline entry point
 
-`active_train_parallel.sh` is a thin POSIX shell wrapper that takes a phase and then forwards options to the Python entry point. Every option has an environment-variable default, so a whole run can be configured from one export block, and command-line options override the environment.
+`pls_compression.pipeline` is the two-phase entry point. It takes a phase and then forwards options to `pls_compression.orchestration`. Every option has an environment-variable default, so a whole run can be configured from one export block, and command-line options override the environment.
 
 ```sh
 # 1. generate training data with four simulators in parallel
-FRAMES_PER_RUN=100 RUNS_PER_CYCLE=8 MAX_PARALLEL=4 \
-  ./active_train_parallel.sh generate
+python3 active_train_parallel.py generate --runs-per-cycle 8 --max-parallel 4
 
 # 2. train against it, resuming from the previous cycle if one exists
-SKIP_FRAMES=1 BATCH_SIZE=8 EFFECTIVE_BATCH=32 EPOCHS=100 DEVICE=cuda CYCLES=1 \
-  ./active_train_parallel.sh train
+SKIP_FRAMES=10 BATCH_SIZE=8 EFFECTIVE_BATCH=32 EPOCHS=100 DEVICE=cuda \
+  python3 active_train_parallel.py train
 
 # or both in one call
-./active_train_parallel.sh all --variant density_velocity --epochs 50
+python3 active_train_parallel.py all --variant density_velocity --epochs 50
 ```
 
-Environment variables: `VARIANT`, `DATA_DIR`, `OUTPUT_DIR`, `FRAMES_PER_RUN`, `RUNS_PER_CYCLE`, `MAX_PARALLEL`, `CYCLES`, `EPOCHS`, `BATCH_SIZE`, `EFFECTIVE_BATCH`, `SKIP_FRAMES`, `LEARNING_RATE`, `VALIDATION_FRACTION`, `NUM_WORKERS`, `MODEL_FILENAME`, `MIN_DELTA`, `SAVE_EVERY`, `KEEP_LAST_CHECKPOINTS`, `DEVICE`, `MAX_SESSIONS`, `SIMULATION_SEED`, `SEED`, `WIDTH`, `HEIGHT`, `LATENT_DIM`, `MAX_BATCHES`, `SMOKE`, `SPH_ROOT`, `NO_RESUME`, `PRUNE`. Run `./active_train_parallel.sh --help` for the full list.
+`active_train_parallel.py` and the module can also be reached as `python3 -m pls_compression.pipeline`. `active_train_parallel.sh` remains a four-line wrapper with no logic of its own.
 
-Before generating anything the script computes the data budget from `frames_per_run`, `runs_per_cycle`, and `cycles`, and refuses to start when the projected size exceeds the free space on the target filesystem. This matters because `spawn_random.sh` on its own defaults to 10000 frames per session, which is roughly 24 GiB at 400x400. The check resolves the nearest existing ancestor directory, since the data directory usually does not exist yet, and warns rather than skipping if free space cannot be determined.
+`active_train.py` and `active_train.sh` call `orchestration.main` directly. They accept every orchestration option, including `--phase`, but **not** as a positional argument, and they have no environment defaults and no data budget guard. Use `active_train_parallel.py` for anything that generates data:
 
-`active_train.sh` remains a bare wrapper around the same Python entry point. It accepts every flag listed above but does not have the phase parsing, the environment defaults, or the data budget check.
+```sh
+# works
+python3 active_train_parallel.py all --runs-per-cycle 8
+python3 active_train.py --phase all --runs-per-cycle 8
+
+# does not work
+python3 active_train.py all --runs-per-cycle 8
+```
+
+Run `python3 active_train_parallel.py --help` for the full option and environment-variable list.
+
+Options are forwarded to `orchestration` as text and converted there, so `orchestration` stays the single place that validates the training configuration. Invalid values are rejected when the configuration is built rather than at the first training step.
+
+Before generating anything the pipeline computes the data budget from `frames_per_run`, `runs_per_cycle`, and `cycles`, and refuses to start when the projected size exceeds the free space on the target filesystem. This matters because `spawn_random.sh` on its own defaults to 10000 frames per session, which is roughly 24 GiB at 400x400. The check resolves the nearest existing ancestor directory, since the data directory usually does not exist yet, and warns rather than skipping if free space cannot be determined.
+
+`SIM_WIDTH` and `SIM_HEIGHT` describe the resolution the simulator produces, which is fixed by the C++ build, and are deliberately separate from the model `WIDTH` and `HEIGHT`. The budget is computed from the simulator resolution rather than the model shape, and a mismatch between the two is reported because session validation will reject the data.
+
+Environment variables: `VARIANT`, `DATA_DIR`, `OUTPUT_DIR`, `FRAMES_PER_RUN`, `RUNS_PER_CYCLE`, `MAX_PARALLEL`, `CYCLES`, `EPOCHS`, `BATCH_SIZE`, `EFFECTIVE_BATCH`, `SKIP_FRAMES`, `LEARNING_RATE`, `VALIDATION_FRACTION`, `NUM_WORKERS`, `MODEL_FILENAME`, `MIN_DELTA`, `SAVE_EVERY`, `KEEP_LAST_CHECKPOINTS`, `DEVICE`, `MAX_SESSIONS`, `SIMULATION_SEED`, `SEED`, `WIDTH`, `HEIGHT`, `LATENT_DIM`, `MAX_BATCHES`, `SMOKE`, `SPH_ROOT`, `NO_RESUME`, `PRUNE`, `SIM_WIDTH`, `SIM_HEIGHT`.
 
 ### Legacy entry points
 
 ```sh
-./active_train.sh --data-dir data --output-dir attempts --model-variant density --runs-per-cycle 1
-SPH_MODEL_VARIANT=density_velocity ./active_train.sh --data-dir data --output-dir attempts --runs-per-cycle 1
+python3 active_train_parallel.py all --data-dir data --output-dir attempts --runs-per-cycle 1
+python3 active_train.py --phase all --data-dir data --output-dir attempts --runs-per-cycle 1
 ```

@@ -47,6 +47,7 @@ from .models import (
 from .training import TrainingConfig, TrainingResult, find_max_batch_size, get_global_stats, resolve_device, select_device, split_sessions, train, train_model
 from .evaluation import EvaluationResult, EvaluationStep, evaluate_checkpoint, load_evaluation_components, plot_evaluation, rollout
 from .orchestration import SPH_ROOT, ActiveLearningConfig, cleanup_storage, prune_cycle_checkpoints, prune_session_directories, resolve_sph_root, run_active_learning, run_simulations, simulation_binary, simulation_build_target
+from .pipeline import DataBudget, build_parser as build_pipeline_parser, build_orchestration_argv, compute_data_budget, main as pipeline_main
 
 __all__ = [
     "WIDTH",
@@ -136,6 +137,11 @@ __all__ = [
     "cleanup_storage",
     "SPH_ROOT",
     "resolve_sph_root",
+    "DataBudget",
+    "build_pipeline_parser",
+    "build_orchestration_argv",
+    "compute_data_budget",
+    "pipeline_main",
     "simulation_binary",
     "simulation_build_target",
 ]
