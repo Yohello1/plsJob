@@ -1,71 +1,102 @@
 #include "spatial.hpp"
-#include "floaters.hpp"
 
-#include "settings.hpp"
-#include "struct.hpp"
-#include "graphics.hpp"
-#include <vector>
+#include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstring>
+
+#include "floaters.hpp"
+#include "graphics.hpp"
+#include "settings.hpp"
+#include "sycl.hpp"
 
 namespace JD::spatial
 {
+    namespace
+    {
+        std::array<int, static_cast<std::size_t>(BUFFER_LINE) * BUFFER_LINE> current_positions{};
+
+        void waitForQueue()
+        {
+            JD::sycl::compute_queue.wait();
+        }
+    }
+
+    std::optional<std::size_t> cellIndex(float x, float y)
+    {
+        if (!std::isfinite(x) || !std::isfinite(y) || x < 0.0f || y < 0.0f || x >= BUFFER_WIDTH || y >= BUFFER_HEIGHT) {
+            return std::nullopt;
+        }
+        const int gx = static_cast<int>(x / DISTANCE_BETWEEN_POINTS);
+        const int gy = static_cast<int>(y / DISTANCE_BETWEEN_POINTS);
+        if (gx < 0 || gx >= BUFFER_LINE || gy < 0 || gy >= BUFFER_LINE) {
+            return std::nullopt;
+        }
+        return static_cast<std::size_t>(gx + gy * BUFFER_LINE);
+    }
+
     void offsetsCreation()
     {
-        memset(JD::graphics::cells_ctr, 0, sizeof(int)*(BUFFER_LINE*BUFFER_LINE));
-
-        for(size_t i = 0; i < FLOATER_AMT; i++)
-        {
-            int gx = (JD::floaters::floatersA.x[i]) / DISTANCE_BETWEEN_POINTS;
-            int gy = (JD::floaters::floatersA.y[i]) / DISTANCE_BETWEEN_POINTS;
-
-            if (gx >= 0 && gx < BUFFER_LINE && gy >= 0 && gy < BUFFER_LINE) {
-                int idx = gx + gy * BUFFER_LINE;
-                JD::graphics::cells_ctr[idx] += 1;
+        if (JD::graphics::cells_ctr == nullptr || JD::graphics::offsets == nullptr) {
+            return;
+        }
+        waitForQueue();
+        std::fill_n(JD::graphics::cells_ctr, static_cast<std::size_t>(BUFFER_LINE) * BUFFER_LINE, 0);
+        for (std::size_t index = 0; index < JD::floaters::FLOATER_AMT; ++index) {
+            const auto cell = cellIndex(JD::floaters::floatersA.x[index], JD::floaters::floatersA.y[index]);
+            if (cell.has_value()) {
+                ++JD::graphics::cells_ctr[*cell];
             }
         }
-
-        for(int i = 0, j = 0; i < (BUFFER_LINE * BUFFER_LINE); i++)
-        {
-            JD::graphics::offsets[i] = j;
-            j += JD::graphics::cells_ctr[i];
+        int offset = 0;
+        for (std::size_t index = 0; index < static_cast<std::size_t>(BUFFER_LINE) * BUFFER_LINE; ++index) {
+            JD::graphics::offsets[index] = offset;
+            offset += JD::graphics::cells_ctr[index];
         }
     }
 
     std::vector<std::pair<int, int>> calculateRegionsOffsets()
     {
-        std::vector<std::pair<int, int>> combined_list;
-
+        std::vector<std::pair<int, int>> result;
         for (int y = -INFLUENCE_RADIUS; y <= INFLUENCE_RADIUS; ++y) {
             for (int x = -INFLUENCE_RADIUS; x <= INFLUENCE_RADIUS; ++x) {
                 if (std::abs(x) + std::abs(y) <= INFLUENCE_RADIUS) {
-                    combined_list.push_back({x, y});
+                    result.emplace_back(x, y);
                 }
             }
         }
-
-        return combined_list;
+        return result;
     }
 
-    uint32_t* _curr_pos = (uint32_t*)calloc(sizeof(uint32_t), BUFFER_LINE*BUFFER_LINE);
     void computeIndicies()
     {
-        std::memset(_curr_pos, 0, sizeof(uint32_t)*BUFFER_LINE*BUFFER_LINE);
-        for(size_t i = 0; i < FLOATER_AMT; i++)
-        {
-            int gx = (JD::floaters::floatersA.x[i]) / DISTANCE_BETWEEN_POINTS;
-            int gy = (JD::floaters::floatersA.y[i]) / DISTANCE_BETWEEN_POINTS;
-
-            if (gx >= 0 && gx < BUFFER_LINE && gy >= 0 && gy < BUFFER_LINE) {
-                int idx = gx + gy * BUFFER_LINE;
-                int offset = JD::graphics::offsets[idx];
-                /// this should never happen................
-                /// (more thingies than expected)
-                if ((size_t)_curr_pos[idx] < (size_t)JD::graphics::cells_ctr[idx]) {
-                    JD::graphics::particles_loc[offset + _curr_pos[idx]] = i;
-                    _curr_pos[idx] += 1;
-                }
+        if (JD::graphics::particles_loc == nullptr || JD::graphics::offsets == nullptr || JD::graphics::cells_ctr == nullptr) {
+            return;
+        }
+        waitForQueue();
+        current_positions.fill(0);
+        for (std::size_t index = 0; index < JD::floaters::FLOATER_AMT; ++index) {
+            const auto cell = cellIndex(JD::floaters::floatersA.x[index], JD::floaters::floatersA.y[index]);
+            if (!cell.has_value()) {
+                continue;
             }
+            const int position = current_positions[*cell];
+            if (position >= JD::graphics::cells_ctr[*cell]) {
+                continue;
+            }
+            JD::graphics::particles_loc[JD::graphics::offsets[*cell] + position] = static_cast<int>(index);
+            current_positions[*cell] = position + 1;
         }
     }
 
+    void computeBlockIndicies()
+    {
+        computeIndicies();
+    }
+
+    void rebuild()
+    {
+        offsetsCreation();
+        computeIndicies();
+    }
 }

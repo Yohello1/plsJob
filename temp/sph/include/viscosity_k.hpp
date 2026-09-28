@@ -1,19 +1,22 @@
-#ifndef _VISCOSITY_K_HPP
-#define _VISCOSITY_K_HPP
+#ifndef JD_VISCOSITY_K_HPP
+#define JD_VISCOSITY_K_HPP
 
+#include <sycl/sycl.hpp>
+
+#include "settings.hpp"
 #include "struct.hpp"
 
-namespace JD::Viscosity_k {
-    inline float laplacian(float distance_i, float particle_size_i) 
+namespace JD::Viscosity_k
+{
+    inline float laplacian(float distance_squared, float particle_size)
     {
-        float h = particle_size_i;
-        float h2 = h * h;
-        if (distance_i < 0 || distance_i >= h2) return 0.0f;
-
-        float coeff = (1/(h2*h2*h2 )) * PARTICLE_VISCOSITY_K_COEFF;
-
-        return coeff * (h - std::sqrtf(distance_i)) ;
+        const float h2 = particle_size * particle_size;
+        if (distance_squared <= 0.0f || distance_squared >= h2) {
+            return 0.0f;
+        }
+        const float coefficient = PARTICLE_VISCOSITY_K_COEFF / (h2 * h2 * h2);
+        return coefficient * (particle_size - ::sycl::sqrt(distance_squared));
     }
-};
+}
 
 #endif

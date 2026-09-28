@@ -1,0 +1,4 @@
+numpy
+torch
+matplotlib
+bitsandbytes; platform_system == "Linux"

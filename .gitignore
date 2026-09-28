@@ -1,3 +1,7 @@
 */*.o*
 draw2
+draw2-density-only
+draw2-density-velocity
+temp/sph/build/
+temp/sph/data/
 temp/sph/frames/*

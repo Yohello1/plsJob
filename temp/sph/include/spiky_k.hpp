@@ -1,26 +1,29 @@
-#ifndef _SPIKY_K_HPP
-#define _SPIKY_K_HPP
+#ifndef JD_SPIKY_K_HPP
+#define JD_SPIKY_K_HPP
 
-#include "struct.hpp" 
+#include <sycl/sycl.hpp>
 
-namespace JD::Spiky_k {
-    inline void gradient(float dx, float dy, float dist_sq, float h, force& out_force) 
+#include "settings.hpp"
+#include "struct.hpp"
+
+namespace JD::Spiky_k
+{
+    inline void gradient(float dx, float dy, float distance_squared, float particle_size, force& result)
     {
-        float h2 = h * h;
-        if (dist_sq <= 0.0f || dist_sq >= h2) {
-            out_force = {0.0f, 0.0f};
+        const float h2 = particle_size * particle_size;
+        if (distance_squared <= 0.0f || distance_squared >= h2) {
+            result = {0.0f, 0.0f};
             return;
         }
-
-        float dist = std::sqrt(dist_sq);
-        float inv_dist = 1.0f / dist;
-
-        float diff = h - dist;
-        float scalar = (PARTICLE_SPIKY_K * diff * diff) * inv_dist;
-
-        out_force.x = scalar * dx;
-        out_force.y = scalar * dy;
+        const float distance = ::sycl::sqrt(distance_squared);
+        const float difference = particle_size - distance;
+        const float h3 = particle_size * particle_size * particle_size;
+        const float h6 = h3 * h3;
+        const float coefficient = -45.0f / (PI * h6);
+        const float scalar = coefficient * difference * difference / (distance + 1.0e-6f);
+        result.x = scalar * dx;
+        result.y = scalar * dy;
     }
-};
+}
 
 #endif

@@ -1,76 +1,69 @@
+#ifndef JD_STRUCT_HPP
+#define JD_STRUCT_HPP
 
-#ifndef _STRUCT_HPP
+#include <cstdint>
 
-#define _STRUCT_HPP
-#include <stdint.h>
 #include "settings.hpp"
+
+struct SpawnBox
+{
+    float x;
+    float y;
+    float w;
+    float h;
+};
 
 struct point
 {
-    uint16_t x;
-    uint16_t y;
-
-    uint16_t i_x;
-    uint16_t i_y;
-
-    uint16_t id;
+    std::uint16_t x;
+    std::uint16_t y;
+    std::uint16_t i_x;
+    std::uint16_t i_y;
+    std::uint16_t id;
     float strength;
-
     int regions[REGIONS_AMT];
-
 };
 
-struct floater {
+struct floater
+{
     float density;
-
     float p_x;
     float p_y;
-
     float x;
     float y;
-
-    float v_x; // full
-    float v_y; // full
-
-    float v_x_h; // half
-    float v_y_h; // half
-
+    float v_x;
+    float v_y;
+    float v_x_h;
+    float v_y_h;
     float a_x;
     float a_y;
-
     float mass;
     float pressure;
-
-    bool enabled; // true: enabled, false: disabled
+    bool enabled;
 };
 
-struct floaters_soa {
+struct floaters_soa
+{
     float* density;
-
     float* p_x;
     float* p_y;
-
     float* x;
     float* y;
-
     float* v_x;
     float* v_y;
-
     float* v_x_h;
     float* v_y_h;
-
     float* a_x;
     float* a_y;
-
     float* mass;
     float* pressure;
-
     bool* enabled;
 };
 
-struct force {
+struct force
+{
     float x;
     float y;
-
 };
+
 #endif

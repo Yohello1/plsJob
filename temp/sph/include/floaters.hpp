@@ -1,40 +1,43 @@
-#ifndef _FLOATERS_HPP
-#define _FLOATERS_HPP
+#ifndef JD_FLOATERS_HPP
+#define JD_FLOATERS_HPP
 
-#include <climits>
+#include <cstddef>
+#include <cstdint>
+#include <vector>
 
 #include "ghost.hpp"
-#include "struct.hpp"
 #include "settings.hpp"
-
-inline constexpr size_t DESIRED_FLOATERS = 1000;
-static inline constexpr size_t GHOST_FLOATERS = 200000;  // should be a function/equation but I cannot rn make it up
-                                                    // siracha at 3:45am
-inline constexpr size_t FLOATER_AMT = DESIRED_FLOATERS + GHOST_FLOATERS;  
-inline constexpr int FLOATER_SPEED = 3;
+#include "struct.hpp"
 
 namespace JD::floaters
 {
-    static constexpr inline size_t BLOCK_AMT = BUFFER_LINE*BUFFER_LINE;
-    static constexpr inline int BLOCK_NEIGHBOR_DIM   = 2 * INFLUENCE_RADIUS + 1;
-    static constexpr inline int BLOCK_NEIGHBOR_COUNT = BLOCK_NEIGHBOR_DIM * BLOCK_NEIGHBOR_DIM;
-   
+    inline constexpr std::size_t DESIRED_FLOATERS = ::DESIRED_FLOATERS;
+    inline constexpr std::size_t GHOST_FLOATERS = ::GHOST_FLOATERS;
+    inline constexpr std::size_t FLOATER_AMT = ::FLOATER_AMT;
+    inline constexpr int FLOATER_SPEED = ::FLOATER_SPEED;
+    inline constexpr std::size_t BLOCK_AMT = static_cast<std::size_t>(BUFFER_LINE) * BUFFER_LINE;
+    inline constexpr int BLOCK_NEIGHBOR_DIM = 2 * INFLUENCE_RADIUS + 1;
+    inline constexpr int BLOCK_NEIGHBOR_COUNT = BLOCK_NEIGHBOR_DIM * BLOCK_NEIGHBOR_DIM;
+
     struct block
     {
-        uint32_t regions[BLOCK_NEIGHBOR_COUNT];
+        std::uint32_t regions[BLOCK_NEIGHBOR_COUNT];
     };
 
     extern floaters_soa floatersA;
-    extern block*   blocks; 
+    extern block* blocks;
 
-    void init();
-
-    void initFloaters();
+    void init(float spawn_x = -1.0f,
+              float spawn_y = -1.0f,
+              const std::vector<SpawnBox>& fluid_boxes = {},
+              const std::vector<SpawnBox>& ghost_boxes = {});
+    void initFloaters(float spawn_x = -1.0f,
+                      float spawn_y = -1.0f,
+                      const std::vector<SpawnBox>& fluid_boxes = {},
+                      const std::vector<SpawnBox>& ghost_boxes = {});
     void drawFloaters();
-
     void initBlockRegions();
-
+    void shutdown();
 }
 
-
-#endif // _FLOATERS_HPP
+#endif
