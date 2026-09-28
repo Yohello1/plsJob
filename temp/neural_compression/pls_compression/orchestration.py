@@ -4,6 +4,7 @@ import argparse
 import copy
 import math
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -51,6 +52,20 @@ def _positive_int(value: Any, name: str) -> int:
     return result
 
 
+def _integer(value: Any, name: str, minimum: int) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer")
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if result != value and not (isinstance(value, str) and str(result) == value.strip()):
+        raise ValueError(f"{name} must be an integer")
+    if result < minimum:
+        raise ValueError(f"{name} must be at least {minimum}")
+    return result
+
+
 @dataclass
 class ActiveLearningConfig:
     data_dir: str | Path
@@ -80,6 +95,9 @@ class ActiveLearningConfig:
     noise_std: float = 0.0
     num_workers: int = 0
     model_filename: str = DEFAULT_MODEL_FILENAME
+    min_delta: float = 0.0
+    save_every: int = 1
+    keep_last_checkpoints: int = 0
     resume: bool = True
     phase: str = PHASE_ALL
 
@@ -137,6 +155,18 @@ class ActiveLearningConfig:
         self.model_filename = str(self.model_filename)
         if not self.model_filename:
             raise ValueError("model_filename must not be empty")
+        self.min_delta = float(self.min_delta)
+        if not math.isfinite(self.min_delta) or self.min_delta < 0:
+            raise ValueError("min_delta must be non-negative and finite")
+        self.save_every = _positive_int(self.save_every, "save_every")
+        self.keep_last_checkpoints = _integer(self.keep_last_checkpoints, "keep_last_checkpoints", 0)
+        if self.keep_last_checkpoints < 0:
+            raise ValueError("keep_last_checkpoints must be non-negative")
+        if self.resume and self.keep_last_checkpoints == 1:
+            raise ValueError(
+                "keep_last_checkpoints must be 0 (keep all) or at least 2 when resume is enabled, "
+                "because each cycle reads the previous cycle's checkpoint"
+            )
         self.resume = bool(self.resume)
         if self.simulation_args is None:
             self.simulation_args = ()
@@ -315,6 +345,39 @@ def cleanup_storage(data_dir: str | Path, max_sessions: int, dry_run: bool = Fal
     return prune_session_directories(data_dir, max_sessions, dry_run)
 
 
+def prune_cycle_checkpoints(output_dir: str | Path, keep_last: int, model_filename: str = DEFAULT_MODEL_FILENAME) -> list[Path]:
+    """Delete all but the newest ``keep_last`` per-cycle checkpoint directories.
+
+    Each cycle writes a full state dict, which is 162 MiB for the default model,
+    so an unbounded cycle count is the main source of checkpoint disk growth.
+    Directories are matched by name and only the checkpoint file inside them is
+    removed, so losses.csv and run_config.json survive for every cycle.
+    """
+    root = Path(output_dir).expanduser().resolve()
+    if keep_last <= 0 or not root.is_dir():
+        return []
+    pattern = re.compile(r"^cycle_(\d+)$")
+    cycles: list[tuple[int, Path]] = []
+    for child in root.iterdir():
+        if not child.is_dir():
+            continue
+        match = pattern.match(child.name)
+        if match is None:
+            continue
+        cycles.append((int(match.group(1)), child))
+    cycles.sort()
+    removed: list[Path] = []
+    for _, child in cycles[:-keep_last] if keep_last < len(cycles) else []:
+        target = child / model_filename
+        try:
+            if target.is_file():
+                target.unlink()
+                removed.append(target)
+        except OSError:
+            continue
+    return removed
+
+
 def _cycle_training_config(config: ActiveLearningConfig, cycle: int) -> TrainingConfig:
     shared: dict[str, Any] = {
         "data_dir": config.data_dir,
@@ -332,6 +395,8 @@ def _cycle_training_config(config: ActiveLearningConfig, cycle: int) -> Training
         "noise_std": config.noise_std,
         "num_workers": config.num_workers,
         "model_filename": config.model_filename,
+        "min_delta": config.min_delta,
+        "save_every": config.save_every,
         "seed": config.seed,
         "model_config": ModelConfig(model_variant=config.model_variant),
     }
@@ -354,6 +419,8 @@ def _cycle_training_config(config: ActiveLearningConfig, cycle: int) -> Training
         "noise_std",
         "num_workers",
         "model_filename",
+        "min_delta",
+        "save_every",
     ):
         setattr(training_config, name, shared[name])
     training_config.epochs = config.epochs
@@ -386,6 +453,7 @@ def run_active_learning(config: ActiveLearningConfig) -> list[TrainingResult]:
         result = train_model(config=training_config, resume_path=resume_path)
         results.append(result)
         previous_checkpoint = result.checkpoint
+        prune_cycle_checkpoints(config.output_dir, config.keep_last_checkpoints, config.model_filename)
     return results
 
 
@@ -436,6 +504,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--noise-std", "--noise_std", dest="noise_std", type=float, default=0.0)
     parser.add_argument("--num-workers", "--num_workers", dest="num_workers", type=int, default=0)
     parser.add_argument("--model-filename", "--model_filename", dest="model_filename", default=DEFAULT_MODEL_FILENAME)
+    parser.add_argument("--min-delta", "--min_delta", dest="min_delta", type=float, default=0.0, help="minimum validation-loss improvement worth a checkpoint write")
+    parser.add_argument("--save-every", "--save_every", dest="save_every", type=int, default=1, help="only write on epochs divisible by this")
+    parser.add_argument("--keep-last-checkpoints", "--keep_last_checkpoints", dest="keep_last_checkpoints", type=int, default=0, help="retain only the newest N cycle checkpoints, 0 keeps all")
     parser.add_argument("--no-resume", dest="resume", action="store_false", default=True, help="restart from random init each cycle")
     return parser
 
@@ -483,6 +554,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         noise_std=args.noise_std,
         num_workers=args.num_workers,
         model_filename=args.model_filename,
+        min_delta=args.min_delta,
+        save_every=args.save_every,
+        keep_last_checkpoints=args.keep_last_checkpoints,
         resume=args.resume,
         training_config=TrainingConfig(
             data_dir=Path(args.data_dir).expanduser().resolve(),

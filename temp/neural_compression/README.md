@@ -199,9 +199,31 @@ Checkpoints are written per cycle to `<output-dir>/cycle_N/<model-filename>`.
 | `--noise-std` | 0.0 | input noise during training |
 | `--num-workers` | 0 | dataloader workers |
 | `--model-filename` | `best_model.pth` | |
+| `--min-delta` | 0.0 | minimum validation-loss gain worth a checkpoint write |
+| `--save-every` | 1 | only write on epochs divisible by this |
+| `--keep-last-checkpoints` | 0 | retain only the newest N cycle checkpoints, 0 keeps all |
 | `--no-resume` | off | restart from random init each cycle |
 
 Model shape flags (`--base-channels`, `--bottleneck-channels`, `--context-channels`, `--projection-dim`, `--num-downsamples`) are exposed alongside them, matching `pls-compression train`. Invalid combinations, such as an effective batch below the batch size or a validation fraction outside `(0, 1)`, are rejected when the configuration is built rather than at the first training step.
+
+### Checkpoint cost
+
+The default model is 42.5M parameters, so a checkpoint is **162 MiB**. Left alone, one is written every time validation loss improves, and one is retained per cycle.
+
+`--min-delta` and `--save-every` throttle the writes. With validation improving on every one of 12 epochs, measured on 400x400 data:
+
+| setting | writes | bytes written |
+| --- | --- | --- |
+| default | 12 | 1946 MiB |
+| `--save-every 4` | 4 | 649 MiB |
+| `--min-delta 0.05` | 1 | 162 MiB |
+| both | 1 | 162 MiB |
+
+The first write always happens, so a run that improves only marginally, or never improves again, still leaves a usable checkpoint. `best_validation_loss` and `losses.csv` always report the true minimum even when the write is suppressed, so the reported number and the saved weights can differ by at most `min_delta`. If you need the saved weights to match the reported best exactly, leave `min_delta` at 0.
+
+`--keep-last-checkpoints N` bounds retention across cycles by deleting the checkpoint file in older `cycle_N` directories. `losses.csv` and `run_config.json` are never deleted, so history stays complete. It must be 0 or at least 2 when resume is enabled, because each cycle reads the previous cycle's checkpoint.
+
+Both settings are worth raising for long runs, and neither changes what is trained.
 
 ### The pipeline script
 
@@ -220,7 +242,7 @@ SKIP_FRAMES=1 BATCH_SIZE=8 EFFECTIVE_BATCH=32 EPOCHS=100 DEVICE=cuda CYCLES=1 \
 ./active_train_parallel.sh all --variant density_velocity --epochs 50
 ```
 
-Environment variables: `VARIANT`, `DATA_DIR`, `OUTPUT_DIR`, `FRAMES_PER_RUN`, `RUNS_PER_CYCLE`, `MAX_PARALLEL`, `CYCLES`, `EPOCHS`, `BATCH_SIZE`, `EFFECTIVE_BATCH`, `SKIP_FRAMES`, `LEARNING_RATE`, `VALIDATION_FRACTION`, `NUM_WORKERS`, `MODEL_FILENAME`, `DEVICE`, `MAX_SESSIONS`, `SIMULATION_SEED`, `SEED`, `WIDTH`, `HEIGHT`, `LATENT_DIM`, `MAX_BATCHES`, `SMOKE`, `SPH_ROOT`, `NO_RESUME`, `PRUNE`. Run `./active_train_parallel.sh --help` for the full list.
+Environment variables: `VARIANT`, `DATA_DIR`, `OUTPUT_DIR`, `FRAMES_PER_RUN`, `RUNS_PER_CYCLE`, `MAX_PARALLEL`, `CYCLES`, `EPOCHS`, `BATCH_SIZE`, `EFFECTIVE_BATCH`, `SKIP_FRAMES`, `LEARNING_RATE`, `VALIDATION_FRACTION`, `NUM_WORKERS`, `MODEL_FILENAME`, `MIN_DELTA`, `SAVE_EVERY`, `KEEP_LAST_CHECKPOINTS`, `DEVICE`, `MAX_SESSIONS`, `SIMULATION_SEED`, `SEED`, `WIDTH`, `HEIGHT`, `LATENT_DIM`, `MAX_BATCHES`, `SMOKE`, `SPH_ROOT`, `NO_RESUME`, `PRUNE`. Run `./active_train_parallel.sh --help` for the full list.
 
 Before generating anything the script computes the data budget from `frames_per_run`, `runs_per_cycle`, and `cycles`, and refuses to start when the projected size exceeds the free space on the target filesystem. This matters because `spawn_random.sh` on its own defaults to 10000 frames per session, which is roughly 24 GiB at 400x400. The check resolves the nearest existing ancestor directory, since the data directory usually does not exist yet, and warns rather than skipping if free space cannot be determined.
 

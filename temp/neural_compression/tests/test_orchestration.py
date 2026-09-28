@@ -14,6 +14,7 @@ from pls_compression.orchestration import (
     ActiveLearningConfig,
     build_parser,
     main,
+    prune_cycle_checkpoints,
     run_active_learning,
     run_simulations,
     simulation_binary,
@@ -244,6 +245,99 @@ class ResumeAcrossCyclesTests(unittest.TestCase):
                 run_active_learning(config)
             for call in train.call_args_list:
                 self.assertIsNone(call.kwargs["resume_path"])
+
+
+class CheckpointRetentionTests(unittest.TestCase):
+    def _make_cycles(self, root, count, filename="best_model.pth"):
+        for index in range(1, count + 1):
+            directory = root / f"cycle_{index}"
+            directory.mkdir(parents=True)
+            (directory / filename).write_bytes(b"weights")
+            (directory / "losses.csv").write_text("epoch\n1.0\n", encoding="utf-8")
+
+    def test_keeps_only_the_newest_checkpoints(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._make_cycles(root, 6)
+            removed = prune_cycle_checkpoints(root, keep_last=2)
+            self.assertEqual(len(removed), 4)
+            remaining = sorted(p.name for p in root.glob("cycle_*") if (p / "best_model.pth").is_file())
+            self.assertEqual(remaining, ["cycle_5", "cycle_6"])
+
+    def test_pruning_keeps_history_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._make_cycles(root, 4)
+            prune_cycle_checkpoints(root, keep_last=1)
+            for index in (1, 2, 3, 4):
+                self.assertTrue((root / f"cycle_{index}" / "losses.csv").is_file())
+                self.assertTrue((root / f"cycle_{index}").is_dir())
+
+    def test_keep_zero_keeps_everything(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._make_cycles(root, 5)
+            self.assertEqual(prune_cycle_checkpoints(root, keep_last=0), [])
+            self.assertEqual(len(list(root.glob("cycle_*/best_model.pth"))), 5)
+
+    def test_resume_requires_keeping_at_least_two(self):
+        with self.assertRaises(ValueError):
+            ActiveLearningConfig(data_dir="d", output_dir="o", resume=True, keep_last_checkpoints=1)
+        # allowed when resume is off, or when keeping more
+        ActiveLearningConfig(data_dir="d", output_dir="o", resume=False, keep_last_checkpoints=1)
+        ActiveLearningConfig(data_dir="d", output_dir="o", resume=True, keep_last_checkpoints=2)
+
+    def test_cycle_loop_prunes_after_training(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = ActiveLearningConfig(
+                data_dir=root / "data",
+                output_dir=root / "out",
+                cycles=3,
+                runs_per_cycle=0,
+                keep_last_checkpoints=1,
+                resume=False,
+                simulation_command=["true"],
+            )
+
+            def fake_train(config, resume_path=None):
+                path = Path(config.output_dir) / config.model_filename
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"weights")
+                return type("Result", (), {"checkpoint": path})()
+
+            with patch("pls_compression.orchestration.run_simulations"), patch(
+                "pls_compression.orchestration.train_model", side_effect=fake_train
+            ):
+                run_active_learning(config)
+            surviving = sorted(p.name for p in (root / "out").glob("cycle_*") if (p / "best_model.pth").is_file())
+            self.assertEqual(surviving, ["cycle_3"])
+
+    def test_throttle_flags_reach_the_cycle_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = ActiveLearningConfig(
+                data_dir=root / "data",
+                output_dir=root / "out",
+                min_delta=0.01,
+                save_every=5,
+                runs_per_cycle=0,
+                simulation_command=["true"],
+            )
+            with patch("pls_compression.orchestration.run_simulations"), patch(
+                "pls_compression.orchestration.train_model"
+            ) as train:
+                train.return_value = type("Result", (), {"checkpoint": root / "c.pth"})()
+                run_active_learning(config)
+            training = train.call_args.kwargs["config"]
+            self.assertEqual(training.min_delta, 0.01)
+            self.assertEqual(training.save_every, 5)
+
+    def test_invalid_throttle_settings_are_rejected(self):
+        for overrides in ({"min_delta": -1.0}, {"min_delta": float("nan")}, {"save_every": 0}):
+            with self.subTest(overrides=overrides):
+                with self.assertRaises(ValueError):
+                    ActiveLearningConfig(data_dir="d", output_dir="o", **overrides)
 
 
 class PhaseTests(unittest.TestCase):

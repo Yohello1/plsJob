@@ -74,6 +74,8 @@ class TrainingConfig:
     fused: bool = False
     use_8bit_adam: bool = False
     model_filename: str = "best_model.pth"
+    min_delta: float = 0.0
+    save_every: int = 1
     width: int | None = None
     height: int | None = None
     model_variant: str | None = None
@@ -139,6 +141,10 @@ class TrainingConfig:
         self.n_steps = _integer(self.n_steps, "n_steps", 1)
         self.skip_initial = _integer(self.skip_initial, "skip_initial", 1)
         self.seed = _integer(self.seed, "seed", 0)
+        self.min_delta = float(self.min_delta)
+        if not math.isfinite(self.min_delta) or self.min_delta < 0:
+            raise ValueError("min_delta must be non-negative and finite")
+        self.save_every = _integer(self.save_every, "save_every", 1)
         self.noise_std = float(self.noise_std)
         self.learning_rate = float(self.learning_rate)
         self.weight_decay = float(self.weight_decay)
@@ -620,8 +626,24 @@ def train_model(
             history.append(row)
             _write_history(output_path, history)
             current_validation_loss = row["val_loss"]
-            if math.isfinite(current_validation_loss) and current_validation_loss < best_validation_loss:
+            improved = math.isfinite(current_validation_loss) and current_validation_loss < best_validation_loss
+            # Measure the margin against the previous best before updating it.
+            improvement = best_validation_loss - current_validation_loss if improved else 0.0
+            if improved:
+                # The reported best always tracks the true minimum, even when the
+                # write is throttled, so losses.csv and the returned result never
+                # disagree with each other.
                 best_validation_loss = current_validation_loss
+            write_due = (epoch + 1) % config.save_every == 0
+            # Writing the full state dict costs one file per improvement, which is
+            # 162 MiB for the default model. Throttle on the improvement margin or
+            # the epoch interval, but always keep the first write so a run that
+            # never improves again still leaves a usable checkpoint.
+            should_write = improved and (
+                not checkpoint_path.is_file()
+                or (improvement >= config.min_delta and write_due)
+            )
+            if should_write:
                 save_checkpoint(
                     checkpoint_path,
                     active_model,

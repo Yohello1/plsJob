@@ -25,6 +25,9 @@
 #   VALIDATION_FRACTION held-out session fraction           (0.1)
 #   NUM_WORKERS        dataloader workers                   (0)
 #   MODEL_FILENAME     checkpoint name                      (best_model.pth)
+#   MIN_DELTA          min val-loss gain worth a 162 MiB write  (0)
+#   SAVE_EVERY         only write on epochs divisible by this   (1)
+#   KEEP_LAST_CHECKPOINTS  retain newest N cycle checkpoints   (0 = all)
 #   DEVICE             auto | cuda | cpu                    (auto)
 #   SPH_ROOT           simulator checkout                   (../sph)
 #   SIM_WIDTH          resolution the simulator produces    (400)
@@ -41,7 +44,7 @@ PHASE=${1:-all}
 case "$PHASE" in
     generate|train|all) shift ;;
     -h|--help)
-        sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'
         exit 0
         ;;
     *)
@@ -72,6 +75,9 @@ LEARNING_RATE=${LEARNING_RATE:-5e-4}
 VALIDATION_FRACTION=${VALIDATION_FRACTION:-0.1}
 NUM_WORKERS=${NUM_WORKERS:-0}
 MODEL_FILENAME=${MODEL_FILENAME:-best_model.pth}
+MIN_DELTA=${MIN_DELTA:-0}
+SAVE_EVERY=${SAVE_EVERY:-1}
+KEEP_LAST_CHECKPOINTS=${KEEP_LAST_CHECKPOINTS:-0}
 DEVICE=${DEVICE:-auto}
 MAX_SESSIONS=${MAX_SESSIONS:-0}
 SIMULATION_SEED=${SIMULATION_SEED:-0}
@@ -107,6 +113,9 @@ while [ "$#" -gt 0 ]; do
         --validation-fraction) require_value "$@"; VALIDATION_FRACTION=$2; shift 2 ;;
         --num-workers)         require_value "$@"; NUM_WORKERS=$2; shift 2 ;;
         --model-filename)      require_value "$@"; MODEL_FILENAME=$2; shift 2 ;;
+        --min-delta)           require_value "$@"; MIN_DELTA=$2; shift 2 ;;
+        --save-every)          require_value "$@"; SAVE_EVERY=$2; shift 2 ;;
+        --keep-last-checkpoints) require_value "$@"; KEEP_LAST_CHECKPOINTS=$2; shift 2 ;;
         --device)              require_value "$@"; DEVICE=$2; shift 2 ;;
         --max-sessions)        require_value "$@"; MAX_SESSIONS=$2; shift 2 ;;
         --simulation-seed)     require_value "$@"; SIMULATION_SEED=$2; shift 2 ;;
@@ -119,7 +128,7 @@ while [ "$#" -gt 0 ]; do
         --smoke)               SMOKE=--smoke; shift ;;
         --no-resume)           NO_RESUME=1; shift ;;
         --prune)               PRUNE=--prune; shift ;;
-        -h|--help)             sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)             sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) printf 'unknown option: %s\n' "$1" >&2; exit 2 ;;
     esac
 done
@@ -183,6 +192,9 @@ set -- \
     --validation-fraction "$VALIDATION_FRACTION" \
     --num-workers "$NUM_WORKERS" \
     --model-filename "$MODEL_FILENAME" \
+    --min-delta "$MIN_DELTA" \
+    --save-every "$SAVE_EVERY" \
+    --keep-last-checkpoints "$KEEP_LAST_CHECKPOINTS" \
     --simulation-seed "$SIMULATION_SEED" \
     --seed "$SEED" \
     --sph-root "$SPH_ROOT"
