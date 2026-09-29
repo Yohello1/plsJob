@@ -320,40 +320,52 @@ def find_max_batch_size(model, device, n_steps=1, is_bf16=False):
     gc.collect()
     return found_batch
 
-def get_global_stats(data_dirs):
-    """Scans all binary files to find the maximum density for normalization."""
-    print("Scanning dataset for global normalization factors...")
+import os
+import numpy as np
+import torch
+
+def get_global_stats_gpu(data_dirs, batch_frames=1000):
+    """Scans binary files using GPU acceleration in memory-efficient frame chunks."""
+    print("Scanning dataset for global normalization factors on GPU...")
     max_density = 1e-6
     max_velocity = 1e-6
-    
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    frame_elements = 4 * BUFFER_WIDTH * BUFFER_HEIGHT
+
     for d_dir in data_dirs:
         bin_file = os.path.join(d_dir, "sim_data.bin")
         if not os.path.exists(bin_file):
             continue
-            
+
         try:
-            # Use memory mapping for high-speed scanning without loading into RAM
             m = np.memmap(bin_file, dtype=np.float32, mode='r')
-            # Each frame is 4 fields of BUFFER_WIDTH * BUFFER_HEIGHT
-            frame_elements = 4 * BUFFER_WIDTH * BUFFER_HEIGHT
             num_frames = m.size // frame_elements
             if num_frames == 0:
                 continue
-                
-            m = m[:num_frames * frame_elements].reshape(-1, 4, BUFFER_HEIGHT, BUFFER_WIDTH)
-            
-            # Density is the first field (index 0)
-            local_max_d = m[:, 0, :, :].max()
-            max_density = max(max_density, local_max_d)
-            
-            # Velocity fields are index 1 and 2
-            local_max_v = np.abs(m[:, 1:3, :, :]).max()
-            max_velocity = max(max_velocity, local_max_v)
-            
-            del m # Close the memory map
+
+            # Process in frame batches so we don't overwhelm GPU VRAM
+            for start in range(0, num_frames, batch_frames):
+                end = min(start + batch_frames, num_frames)
+
+                # Slice NumPy memmap and convert directly to torch tensor
+                chunk_np = m[start * frame_elements : end * frame_elements]
+                chunk_np = chunk_np.reshape(-1, 4, BUFFER_HEIGHT, BUFFER_WIDTH)
+
+                # Transfer batch to GPU
+                tensor = torch.from_numpy(chunk_np).to(device, non_blocking=True)
+
+                # Compute max on GPU
+                local_max_d = tensor[:, 0].max().item()
+                local_max_v = tensor[:, 1:3].abs().max().item()
+
+                max_density = max(max_density, local_max_d)
+                max_velocity = max(max_velocity, local_max_v)
+
+            del m
         except Exception as e:
             print(f"Warning: Could not scan {bin_file} ({e})")
-            
+
     print(f"Scan complete. Max Density: {max_density:.4f}, Max Velocity: {max_velocity:.4f}")
     return max_density, max_velocity
 
