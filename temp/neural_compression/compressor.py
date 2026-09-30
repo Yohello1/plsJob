@@ -11,6 +11,8 @@ import random
 import gc
 import inspect
 
+from manifest_utils import select_sessions, session_paths, describe_selection
+
 try:
     import bitsandbytes as bnb
     HAS_BNB = True
@@ -369,6 +371,35 @@ def get_global_stats_gpu(data_dirs, batch_frames=1000):
     print(f"Scan complete. Max Density: {max_density:.4f}, Max Velocity: {max_velocity:.4f}")
     return max_density, max_velocity
 
+def resolve_session_dirs(args, data_dir):
+    """
+    Decide which simulation sessions this cycle trains on.
+
+    Precedence: explicit --session_dirs > manifest subset > scan of --data_dir.
+    The manifest path is what lets the loops reuse a precomputed dataset, where
+    every simulation already exists but only a slice is exposed per cycle.
+    """
+    if args and getattr(args, 'session_dirs', None):
+        dirs = [d for d in args.session_dirs.split(',') if os.path.isdir(d)]
+        print(f"Using explicit session list: {len(dirs)} sessions.")
+        return dirs
+
+    manifest = getattr(args, 'manifest', None) if args else None
+    if manifest:
+        cycle = getattr(args, 'cycle', 1)
+        runs_per_iteration = getattr(args, 'runs_per_iteration', 0)
+        subset_mode = getattr(args, 'subset_mode', 'window')
+        subset_size = getattr(args, 'subset_size', 0)
+        sessions = select_sessions(manifest, cycle, runs_per_iteration,
+                                   subset_mode, subset_size)
+        print(describe_selection(sessions, subset_mode, subset_size, runs_per_iteration))
+        return session_paths(sessions)
+
+    if os.path.exists(data_dir):
+        return [os.path.join(data_dir, d) for d in os.listdir(data_dir)
+                if os.path.isdir(os.path.join(data_dir, d)) and d != "frames"]
+    return []
+
 def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_filename="best_model.pth", fluid_weight=50.0, mass_loss_weight=0.0, args=None):
     # Determine effective mass loss weight based on curriculum
     current_cycle = args.cycle if args and hasattr(args, 'cycle') else 1
@@ -384,15 +415,10 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Detected {num_gpus} GPU(s). Using device: {device}")
 
-    # Use specified data_dir (or explicit session list if provided)
-    if args and getattr(args, 'session_dirs', None):
-        session_dirs = [d for d in args.session_dirs.split(',') if os.path.isdir(d)]
-    else:
-        session_dirs = [os.path.join(data_dir, d) for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d)) and d != "frames"] if os.path.exists(data_dir) else []
+    session_dirs = resolve_session_dirs(args, data_dir)
     if not session_dirs:
         print(f"No simulation data found in {data_dir}.")
         return
-
     # 1. Configuration & Constants
     LR = 5e-5
     LATENT_DIM_LOCAL = LATENT_DIM
@@ -407,16 +433,28 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     print(f"Starting {run_dir}...")
 
     # 3. Split Dataset (90% Train, 10% Val)
-    # No fixed seed: each training run gets a different split so all runs
-    # eventually appear in training across multiple calls.
-    random.shuffle(session_dirs)
-    split_idx = max(1, int(len(session_dirs) * 0.9))
-    if split_idx >= len(session_dirs) and len(session_dirs) > 1:
-        split_idx = len(session_dirs) - 1
-    
-    train_dirs = session_dirs[:split_idx]
-    val_dirs = session_dirs[split_idx:]
-    print(f"Dataset split: {len(train_dirs)} training sessions, {len(val_dirs)} validation sessions.")
+    # With a precomputed pool the same sessions recur every cycle, so a random
+    # split would move the validation set each cycle and make val_loss
+    # incomparable across cycles, breaking best-checkpoint tracking and the
+    # ReduceLROnPlateau scheduler. `--val_sessions` pins a fixed holdout.
+    val_sessions = getattr(args, 'val_sessions', 0) if args else 0
+    if val_sessions > 0:
+        holdout = val_sessions if val_sessions < len(session_dirs) else max(1, len(session_dirs) // 5)
+        train_dirs = sorted(session_dirs[:-holdout])
+        val_dirs = sorted(session_dirs[-holdout:])
+        print(f"Dataset split (fixed holdout): {len(train_dirs)} training sessions, "
+              f"{len(val_dirs)} held-out validation sessions.")
+    else:
+        # No fixed seed: each training run gets a different split so all runs
+        # eventually appear in training across multiple calls.
+        random.shuffle(session_dirs)
+        split_idx = max(1, int(len(session_dirs) * 0.9))
+        if split_idx >= len(session_dirs) and len(session_dirs) > 1:
+            split_idx = len(session_dirs) - 1
+
+        train_dirs = session_dirs[:split_idx]
+        val_dirs = session_dirs[split_idx:]
+        print(f"Dataset split: {len(train_dirs)} training sessions, {len(val_dirs)} validation sessions.")
 
     # Determine current AR n_steps based on curriculum
     n_steps_limit = args.n_steps if args and hasattr(args, 'n_steps') else 1
@@ -431,7 +469,7 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
     print(f"Curriculum: n_steps = {current_n_steps} (Limit: {n_steps_limit}, Cycle: {current_cycle})")
 
     # Calculate global normalization factors
-    max_d, max_v = get_global_stats(session_dirs)
+    max_d, max_v = get_global_stats_gpu(session_dirs)
     density_norm = 1.0 / max_d
     velocity_norm = 1.0 / max_v
     print(f"Normalization: Density Scale={density_norm:.6f}, Velocity Scale={velocity_norm:.6f}")
@@ -490,6 +528,8 @@ def train(requested_epochs=None, data_dir="data", output_dir="attempts", model_f
         f.write(f"Noise Std: {args.noise_std if args else 0}\n")
         f.write(f"Epochs per Cycle: {epochs}\n")
         f.write(f"Train/Val Split: {len(train_dirs)}/{len(val_dirs)}\n")
+        f.write(f"Dataset Manifest: {getattr(args, 'manifest', None) or 'none (scanned data_dir)'}\n")
+        f.write(f"Subset Mode: {getattr(args, 'subset_mode', 'n/a')} (size {getattr(args, 'subset_size', 0)})\n")
         f.write(f"Loss Function: WeightedMSE (Fluid Weight: {fluid_weight})\n")
         f.write(f"Normalizations: Density={density_norm}, Velocity={velocity_norm}\n")
         f.write(f"Cycle: {current_cycle}\n")
@@ -759,6 +799,12 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--data_dir", type=str, default="data")
     parser.add_argument("--session_dirs", type=str, default=None, help="Comma-separated explicit list of session dirs (overrides --data_dir discovery)")
+    parser.add_argument("--manifest", type=str, default=None, help="Path to a manifest.json from precompute_dataset.py; selects this cycle's subset from the precomputed pool")
+    parser.add_argument("--subset_mode", type=str, default="window", choices=["window", "expanding", "all"],
+                        help="How to pick this cycle's sessions from the manifest: window=newest N, expanding=everything available so far, all=entire pool")
+    parser.add_argument("--subset_size", type=int, default=20, help="Max sessions per cycle in window mode (0 = no cap)")
+    parser.add_argument("--runs_per_iteration", type=int, default=15, help="Dataset size per cycle; determines which manifest entries exist yet at this cycle")
+    parser.add_argument("--val_sessions", type=int, default=0, help="Pin the last N sessions of the selection as a fixed validation holdout (0 = random 10% split each cycle)")
     parser.add_argument("--output_dir", type=str, default="attempts")
     parser.add_argument("--model_name", type=str, default="best_model.pth")
     parser.add_argument("--fluid_weight", type=float, default=25.0)
